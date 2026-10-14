@@ -72,7 +72,7 @@ By contributing, you agree that your contribution is licensed under the [MIT lic
 ### Guidelines that keep it healthy
 
 - **Secrets are the sharp edge.** Anything that reads, stores, logs or returns a credential needs extra care and a test. Credentials must never reach disk, history or agent output unless the user opted in to storing them.
-- **No new network calls** except the requests the user (or their agent) sends. No analytics. An update check (#144, #145) would be opt-in and off by default.
+- **No new network calls** except the requests the user (or their agent) sends. No analytics, no telemetry, no update checks (an update check was considered and declined: #144, #145).
 - **Keep it small.** A new dependency needs a good reason; the size of the exe is a feature.
 - **Match the code around you.** Comments explain *why*, not what. Prefer a small function that's reused over a copy.
 
