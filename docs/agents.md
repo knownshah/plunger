@@ -117,6 +117,19 @@ python scripts/mcp-demo-client.py path\to\plunger.exe
 
 The read-only tools are marked as such, so a client can run them without asking.
 
+## The audit log
+
+Every change Plunger makes to its history is written to `audit.log` first and applied to the database from it: sends (who, when, what, status), saved requests, groups, workflows and their runs, and the variables an agent sets (a secret by name only, never its value). Each line carries the hash of the line before it.
+
+```bash
+plunger audit verify                    # ok with the entry count and head hash, or the first bad entry (exit 4)
+plunger audit show --source mcp --since 1h --action send
+plunger audit head                      # the newest hash, to write down somewhere else
+plunger audit rebuild                   # recreate the database from the log
+```
+
+An agent cannot read or write it: there is no MCP tool for it. What it stops: an edit to the file made without going through Plunger shows up in `verify`. What it does not stop: a process running as you that rewrites the whole file and its hashes (the keyed version is planned, #201).
+
 ## Variables in a JSON body
 
 A `{{variable}}` inside a JSON string is JSON-escaped for you: a description with a line break, a quote or a backslash arrives as exactly that text, so do not escape it yourself (a value you already escaped would arrive with a visible backslash). Outside a string the value is inserted as JSON, so a variable can be a number, `true`, or a whole array or object:

@@ -193,6 +193,47 @@ try:
     check("a form value that is a file path is refused, not sent as text", err and "upload" in text, text)
     err, res, text = mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=auth, timeout_secs=0, method="FETCH")
     check("an adjusted timeout and an odd method are noted", res and len(res.get("problems", [])) >= 2, res and res.get("problems"))
+
+    # 8. the audit log: every change is in it, in order, and tampering with it is found
+    mcp.call("set_variable", name="scenario_token", value="S3CR3T-VALUE-123")
+    mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=dict(auth, **{"X-Secret": "{{scenario_token}}"}))
+    if mcp:
+        mcp.proc.terminate()
+        mcp.proc.wait()
+        mcp = None
+
+    def plunger(*args):
+        r = subprocess.run([PLUNGER, *args], capture_output=True, text=True, encoding="utf-8",
+                           env=dict(os.environ, PLUNGER_DATA_DIR=DATA), timeout=60)
+        try:
+            return r.returncode, json.loads(r.stdout)
+        except ValueError:
+            return r.returncode, {"_raw": r.stdout}
+
+    code, verified = plunger("audit", "verify")
+    check("the audit log verifies", code == 0 and verified.get("ok") and verified.get("entries", 0) > 20, verified)
+    code, shown = plunger("audit", "show", "--source", "mcp", "--action", "send", "--limit", "500")
+    sends = shown.get("entries", [])
+    check("every send an agent made is in the log, with who sent it", len(sends) >= 10 and all(e["source"] == "mcp" for e in sends), len(sends))
+    log_text = open(os.path.join(DATA, "audit.log"), encoding="utf-8").read()
+    check("no secret value is in the log", "S3CR3T-VALUE-123" not in log_text and "scenario_token" in log_text, "")
+
+    # the database can be rebuilt from the log
+    for name in os.listdir(DATA):
+        if name.startswith("history.sqlite3"):
+            os.remove(os.path.join(DATA, name))
+    code, saved_again = plunger("saved")
+    names = [r.get("name") for r in (saved_again.get("requests") if isinstance(saved_again, dict) else saved_again) or []]
+    check("the saved requests come back from the log after the database is deleted", "create issue" in names, names)
+
+    # and an edited line is found, with its number
+    lines = log_text.splitlines()
+    index = next(i for i, l in enumerate(lines) if '"action":"request_added"' in l and '"status":201' in l)
+    lines[index] = lines[index].replace('"status":201', '"status":500')
+    with open(os.path.join(DATA, "audit.log"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    code, broken = plunger("audit", "verify")
+    check("an edited line is found and named", code == 4 and broken.get("ok") is False and broken.get("broken_at") == index + 1, broken)
 finally:
     if mcp:
         mcp.proc.terminate()

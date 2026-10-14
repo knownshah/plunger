@@ -2,4 +2,5 @@
 //! opt-in secret store.
 
 pub mod history;
+pub mod log;
 pub mod secrets;

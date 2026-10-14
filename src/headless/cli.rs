@@ -36,6 +36,11 @@ USAGE
   plunger history [--limit N] [--search TEXT]
                                         Recent requests, newest first (default 20);
                                         --search matches URL, method, name or status
+  plunger audit verify|show|head|rebuild
+                                        The audit log: every change, in order, hash-chained.
+                                        verify finds an edited, removed or reordered line
+                                        (exit 4); show lists it; rebuild recreates the
+                                        database from it
   plunger vars                          List variables (secret values are never shown)
   plunger vars set <name> <value>       Set a variable for later requests ({{name}}); --secret keeps it
                                         in the credential store (use `-` as the value to read stdin)
@@ -202,6 +207,14 @@ plunger save <name> [--url] <url> [send options] [--overwrite]
 Saves the request without sending it. {{placeholders}} (including in Authorization headers) are
 kept as written. An existing name is refused unless --overwrite is given, which replaces it.
 Options are those of `plunger send`: -X, -H, --json, -d, --form, --timeout, --insecure, --no-follow.
+",
+        "audit" => "\
+plunger audit verify                the log's chain: ok with the number of entries and the head hash, or the first bad entry (exit 4)
+plunger audit show [--source gui|cli|mcp] [--action send|request_saved|variable_set|workflow_run|...] [--since 1h|30m|2d] [--limit N]
+                                    the changes, newest last, as one line each (no bodies, no secret values)
+plunger audit head                  the hash of the newest entry, to write down somewhere else
+plunger audit rebuild               recreate the history database from the log (a log that does not verify is refused)
+The log is audit.log beside the database. No agent tool can read or write it.
 ",
         "history" => "\
 plunger history [--limit N] [--search TEXT]   recent requests, newest first (default 20)
@@ -473,6 +486,86 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
             }
             Ok(EXIT_OK)
         }
+        "audit" => {
+            use crate::store::log;
+            let history = crate::store::history::History::open().map_err(|e| error(e.to_string()))?;
+            let path = history.log_path().map(std::path::Path::to_path_buf).ok_or_else(|| error("This database has no audit log"))?;
+            match args.next().as_deref() {
+                Some("verify") => {
+                    args.finish()?;
+                    match log::verify(&path) {
+                        Ok((entries, head)) => {
+                            print_json(&serde_json::json!({ "ok": true, "entries": entries, "head": head, "log": path.display().to_string() }));
+                            Ok(EXIT_OK)
+                        }
+                        Err(broken) => {
+                            print_json(&serde_json::json!({ "ok": false, "broken_at": broken.seq, "reason": broken.reason, "log": path.display().to_string() }));
+                            Ok(EXIT_HTTP_ERROR)
+                        }
+                    }
+                }
+                Some("head") => {
+                    args.finish()?;
+                    match log::verify(&path) {
+                        Ok((entries, head)) => {
+                            print_json(&serde_json::json!({ "entries": entries, "head": head }));
+                            Ok(EXIT_OK)
+                        }
+                        Err(broken) => Err(error(format!("The log is broken at entry {}: {}", broken.seq, broken.reason))),
+                    }
+                }
+                Some("rebuild") => {
+                    args.finish()?;
+                    log::verify(&path).map_err(|b| error(format!("The log is broken at entry {} ({}), so nothing was rebuilt.", b.seq, b.reason)))?;
+                    let applied = history.rebuild_from_log().map_err(|e| error(e.to_string()))?;
+                    print_json(&serde_json::json!({ "rebuilt": true, "entries_applied": applied }));
+                    Ok(EXIT_OK)
+                }
+                Some("show") | None => {
+                    let (mut source, mut action, mut since, mut limit) = (None, None, None, 50usize);
+                    while let Some(arg) = args.next() {
+                        match arg.as_str() {
+                            "--source" => source = Some(args.value(&arg)?),
+                            "--action" => action = Some(args.value(&arg)?),
+                            "--since" => since = Some(args.value(&arg)?),
+                            "--limit" => limit = args.number(&arg)?,
+                            other => return Err(usage_error(format!("Unexpected argument `{other}`"))),
+                        }
+                    }
+                    let cutoff = match since {
+                        Some(text) => Some(since_cutoff(&text).ok_or_else(|| usage_error("--since is like 30m, 2h or 7d"))?),
+                        None => None,
+                    };
+                    let entries = log::read_from(&path, 0).map_err(|e| error(e.to_string()))?;
+                    let mut rows = Vec::new();
+                    for (entry, _) in entries {
+                        if source.as_deref().is_some_and(|s| entry.event.source() != Some(s)) {
+                            continue;
+                        }
+                        if action.as_deref().is_some_and(|a| entry.event.action() != a) {
+                            continue;
+                        }
+                        if let Some(cutoff) = cutoff {
+                            let when = time::OffsetDateTime::parse(&entry.time, &time::format_description::well_known::Rfc3339).ok();
+                            if when.is_some_and(|w| w < cutoff) {
+                                continue;
+                            }
+                        }
+                        rows.push(serde_json::json!({
+                            "seq": entry.seq,
+                            "time": entry.time,
+                            "action": entry.event.action(),
+                            "source": entry.event.source(),
+                            "what": entry.event.summary(),
+                        }));
+                    }
+                    let skip = rows.len().saturating_sub(limit);
+                    print_json(&serde_json::json!({ "entries": rows.into_iter().skip(skip).collect::<Vec<_>>() }));
+                    Ok(EXIT_OK)
+                }
+                Some(other) => Err(usage_error(format!("Unexpected argument `{other}`"))),
+            }
+        }
         "history" => {
             if args.peek_is("show") {
                 args.next();
@@ -717,6 +810,20 @@ pub fn attach_parent_console() {
 #[cfg(not(windows))]
 pub fn attach_parent_console() {}
 
+/// "30m", "2h" or "7d" as the time that long ago.
+fn since_cutoff(text: &str) -> Option<time::OffsetDateTime> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let n: i64 = number.parse().ok()?;
+    let seconds = match unit {
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return None,
+    };
+    Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +901,19 @@ mod tests {
         ] {
             let Err(e) = dispatch(args(&bad)) else { panic!("{bad:?} should fail") };
             assert_eq!((e.code, e.kind), (EXIT_USAGE, "usage"), "{bad:?}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn since_is_minutes_hours_or_days_ago() {
+        use super::since_cutoff;
+        let now = time::OffsetDateTime::now_utc();
+        let hour = since_cutoff("1h").unwrap();
+        assert!((3599..=3601).contains(&(now - hour).whole_seconds()));
+        assert!((29..=30).contains(&(now - since_cutoff("30m").unwrap()).whole_minutes()));
+        assert!((47..=48).contains(&(now - since_cutoff("2d").unwrap()).whole_hours()));
+        for bad in ["", "h", "1", "1w", "x1h"] {
+            assert!(since_cutoff(bad).is_none(), "{bad:?}");
         }
     }
 
