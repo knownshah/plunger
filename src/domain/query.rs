@@ -106,6 +106,39 @@ pub fn encode_value(value: &str) -> String {
     encode(value, false)
 }
 
+/// A value substituted into a URL path: only what would end the path or break the URL is encoded
+/// (`?`, `#`, spaces, control characters). `/` and `%` are left, so a variable may hold a longer path
+/// or an already-encoded segment.
+pub fn encode_path_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '?' | '#' | ' ' => out.push_str(&format!("%{:02X}", c as u32)),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Where the origin ends in a URL written with placeholders: after `scheme://host`, or after a leading
+/// `{{variable}}` and what directly follows it. Values substituted before that point are the origin
+/// (a whole base URL may live in one variable); values after it are path.
+pub fn origin_end(template: &str) -> usize {
+    let start = template.find("://").map(|i| i + 3).unwrap_or(0);
+    let rest = &template[start..];
+    let from = match rest.strip_prefix("{{").and_then(|r| r.find("}}")) {
+        Some(close) => start + 2 + close + 2,
+        None => start,
+    };
+    from + template[from..].find('/').unwrap_or(template.len() - from)
+}
+
 fn in_url(p: &KeyValue) -> bool {
     p.enabled && !p.key.trim().is_empty()
 }

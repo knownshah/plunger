@@ -191,22 +191,39 @@ fn finish_json(text: String, omitted: bool) -> String {
     if !omitted {
         return text;
     }
-    fn prune(value: &mut serde_json::Value) {
+    /// Removes the omitted members and items. A container that this left empty is removed too (an
+    /// `"assignee": {"name": "{{who?}}"}` with no `who` has no assignee), while one that was empty in the
+    /// template stays. Returns whether `value` is such an emptied container.
+    fn prune(value: &mut serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(map) => {
+                let before = map.len();
                 map.retain(|k, v| k != OMIT_VALUE && v.as_str() != Some(OMIT_VALUE));
-                map.values_mut().for_each(prune);
+                let mut dropped = map.len() != before;
+                let emptied: Vec<String> = map.iter_mut().filter_map(|(k, v)| prune(v).then(|| k.clone())).collect();
+                if !emptied.is_empty() {
+                    map.retain(|k, _| !emptied.contains(k));
+                    dropped = true;
+                }
+                dropped && map.is_empty()
             }
             serde_json::Value::Array(items) => {
+                let before = items.len();
                 items.retain(|v| v.as_str() != Some(OMIT_VALUE));
-                items.iter_mut().for_each(prune);
+                let mut dropped = items.len() != before;
+                items.retain_mut(|v| {
+                    let gone = prune(v);
+                    dropped |= gone;
+                    !gone
+                });
+                dropped && items.is_empty()
             }
-            _ => {}
+            _ => false,
         }
     }
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(mut value) => {
-            prune(&mut value);
+            let _ = prune(&mut value);
             serde_json::to_string(&value).unwrap_or(text)
         }
         // not JSON as written; say null rather than send the marker

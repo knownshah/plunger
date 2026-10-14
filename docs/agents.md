@@ -132,7 +132,7 @@ with `labels` set to `["backend", "urgent"]`. Only the JSON body is treated this
 An undefined `{{name}}` refuses the request, so a request never goes out with a literal placeholder. Two marks say a value may be missing (an empty value counts as missing):
 
 - `{{name|default}}` uses `default` when there is no value: `"priority": "{{priority|Medium}}"`, `/search?limit={{limit|20}}`. The default is the text as written after the `|`, escaped like any value.
-- `{{name?}}` is optional. In a JSON body the whole member (or array item) is left out when there is no value: `"assignee": {"name": "{{who?}}"}` becomes `"assignee": {}`, and `"labels": {{labels?}}` and `"epic": "{{epic?}}"` disappear. Elsewhere (the URL, a header, a raw body) it is empty. A body with nothing left out is sent exactly as written; when something is left out the body is re-written as compact JSON.
+- `{{name?}}` is optional. In a JSON body the whole member (or array item) is left out when there is no value: `"assignee": {"name": "{{who?}}"}` disappears (an object that the omission leaves empty goes too, one that was empty in your template stays), and so do `"labels": {{labels?}}` and `"epic": "{{epic?}}"`. Elsewhere (the URL, a header, a raw body) it is empty. A body with nothing left out is sent exactly as written; when something is left out the body is re-written as compact JSON.
 
 One request can then create an issue with an optional assignee, labels and epic.
 

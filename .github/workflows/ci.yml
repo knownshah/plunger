@@ -48,6 +48,8 @@ jobs:
       - run: cargo build --release --locked
       - name: Headless smoke test
         run: scripts/smoke-cli.sh target/release/plunger
+      - name: Agent scenario (a Jira-shaped API, driven like an agent does)
+        run: python3 scripts/agent-scenario.py target/release/plunger
       - name: Upload the binary
         uses: actions/upload-artifact@v7
         with:
@@ -68,3 +70,5 @@ jobs:
       - run: cargo build --release --locked
       - name: Headless smoke test
         run: scripts/smoke-cli.sh target/release/plunger
+      - name: Agent scenario (a Jira-shaped API, driven like an agent does)
+        run: python3 scripts/agent-scenario.py target/release/plunger

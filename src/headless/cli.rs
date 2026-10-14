@@ -565,7 +565,16 @@ impl SendOptions {
             }
             "--json" => {
                 let raw = file_or_text(args.value(arg)?)?;
-                p.json = Some(serde_json::from_str(&raw).map_err(|e| usage_error(format!("--json isn't valid JSON: {e}")))?);
+                match serde_json::from_str(&raw) {
+                    Ok(value) => p.json = Some(value),
+                    // not JSON as typed, but it has placeholders (`"labels": {{labels}}`): send it as a JSON body
+                    // and let the variables make it JSON
+                    Err(_) if raw.contains("{{") => {
+                        p.body = Some(raw);
+                        p.headers.get_or_insert_with(BTreeMap::new).entry("Content-Type".to_string()).or_insert_with(|| "application/json".to_string());
+                    }
+                    Err(e) => return Err(usage_error(format!("--json isn't valid JSON: {e}"))),
+                }
             }
             "-d" | "--data" => p.body = Some(file_or_text(args.value(arg)?)?),
             "--form" => {

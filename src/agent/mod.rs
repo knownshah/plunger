@@ -634,4 +634,85 @@ mod tests {
         assert_eq!(selected["$.fields.summary"], "x");
         assert!(out.problems.is_empty(), "{:?}", out.problems);
     }
+
+    /// Every field a caller can give to `save_request` is accounted for: stored with the request, kept as
+    /// one of its options, or named in `not_saved`. Adding a field to `SendParams` fails this test until
+    /// the new field is placed in one of the three, so it can never be accepted and dropped silently.
+    #[test]
+    fn every_field_of_a_save_is_stored_kept_as_an_option_or_reported() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(SendParams)).unwrap();
+        let mut fields: Vec<String> = schema["properties"].as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+
+        let stored = ["method", "url", "headers", "json", "body", "form"];
+        let options = ["timeout_secs", "follow_redirects", "insecure_tls", "select"];
+        let reported = ["variables", "use_saved_bearer", "extract", "max_body_chars"];
+        let only_when_sending = ["saved_request"];
+        let mut known: Vec<&str> = stored.iter().chain(&options).chain(&reported).chain(&only_when_sending).copied().collect();
+        known.sort();
+        assert_eq!(fields, known, "a SendParams field was added or removed: decide whether a saved request keeps it");
+
+        // and each class does what it says
+        let h = History::in_memory();
+        let session = plain_session();
+        let full: SendParams = serde_json::from_value(serde_json::json!({
+            "method": "PUT", "url": "https://h/{{id}}", "headers": {"X-A": "1"}, "json": {"a": 1},
+            "variables": {"id": "7"}, "use_saved_bearer": true, "timeout_secs": 45, "follow_redirects": false,
+            "insecure_tls": true, "max_body_chars": 100, "select": ["$.a"],
+            "extract": [{"name": "n", "from": "json:$.a"}]
+        }))
+        .unwrap();
+        let saved = requests::save_request_with(&h, &session, "all", false, &full, Source::Mcp).unwrap();
+        assert_eq!((saved.method.as_str(), saved.url.as_str()), ("PUT", "https://h/{{id}}"));
+        assert!(saved.headers.iter().any(|x| x.name == "X-A" && x.value == "1"));
+        assert_eq!(saved.body.as_deref(), Some("{\"a\":1}"));
+        let kept = saved.options.clone().expect("options");
+        assert_eq!((kept.timeout_secs, kept.follow_redirects, kept.insecure_tls), (Some(45), Some(false), Some(true)));
+        assert_eq!(kept.select, vec!["$.a".to_string()]);
+        let said = saved.not_saved.join(" | ");
+        for field in reported {
+            // use_saved_bearer is only reported when asked for, the others when given
+            assert!(said.contains(field), "{field} not reported in: {said}");
+        }
+        // what get_saved_request returns is the same as what the save said
+        let shown = requests::show_saved_request_in(&h, "all").unwrap();
+        assert_eq!((shown.method, shown.url, shown.body, shown.options), (saved.method, saved.url, saved.body, saved.options));
+    }
+
+    #[test]
+    fn what_a_server_can_send_back_never_breaks_the_shaping() {
+        // an empty body, plain text, an error page, a JSON null, a scalar and an array at the root
+        let bodies = ["", "plain words", "<html>502</html>", "null", "42", "\"just a string\"", "[]", "[1, null, {\"a\": null}]", "{\"a\": {\"b\": null}}"];
+        let paths = ["$.a", "$.a.b", "$.a.b.c", "$[0]", "$.items[*].id", "$.items[?(@.k=='x')].id", "header:Location", "header:Missing", "status"];
+        let scrubber = Scrubber::new(&PersistedState::default(), "");
+        for body in bodies {
+            for status in [200u16, 204, 404, 500] {
+                let raw = ResponseData {
+                    status,
+                    headers: vec![("Location".into(), "/x".into())],
+                    body: body.into(),
+                    json_value: serde_json::from_str(body).ok(),
+                    ..Default::default()
+                };
+                let mut out = shaped(serde_json::Value::Null);
+                out.json = raw.json_value.clone();
+                out.body = if raw.json_value.is_none() { Some(body.to_string()) } else { None };
+                let before = (out.json.clone(), out.body.clone());
+                apply_select(&mut out, &raw, &paths.map(String::from), &scrubber);
+                let selected = out.selected.as_ref().expect("select always reports");
+                // it never panics, and when any path could not be read the body is still there to look at
+                if !out.problems.is_empty() {
+                    assert_eq!((out.json.clone(), out.body.clone()), before, "{body:?} {status}: the body was lost");
+                    assert!(out.problems.iter().any(|p| p.contains("whole response")), "{body:?}: {:?}", out.problems);
+                } else {
+                    assert_eq!(selected.len(), paths.len());
+                }
+                // extract never panics either, and says why it could not
+                for path in paths {
+                    let from = if path.starts_with('$') { format!("json:{path}") } else { path.to_string() };
+                    let _ = crate::workflow::extract::extract(&raw, &from);
+                }
+            }
+        }
+    }
 }

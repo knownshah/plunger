@@ -135,7 +135,10 @@ pub fn build_request(state: &PersistedState, bearer_token: &str) -> Result<Outgo
     // substituted into the query are encoded so `&`, `#` or `+` in a variable
     // can't split or corrupt it.
     let (base, query, fragment) = split_url(&state.url);
-    let mut url_text = r.apply(base);
+    // a value in the path cannot start a query or a fragment; the origin may be a whole base URL
+    let origin = crate::domain::query::origin_end(base).min(base.len());
+    let mut url_text = r.apply(&base[..origin]);
+    url_text.push_str(&r.apply_with(&base[origin..], crate::domain::query::encode_path_value));
     if let Some(q) = query {
         url_text.push('?');
         url_text.push_str(&r.apply_with(q, encode_value));
@@ -145,7 +148,17 @@ pub fn build_request(state: &PersistedState, bearer_token: &str) -> Result<Outgo
         url_text.push_str(&r.apply(f));
     }
     let url_text = normalize_url(&url_text);
-    let headers_text = r.apply(&state.headers_text);
+    // one header per line: a value with a line break would start another header
+    let mut header_lines = Vec::new();
+    for line in state.headers_text.lines() {
+        let filled = r.apply(line);
+        if line.contains("{{") && filled.lines().count() > 1 {
+            let name = line.split(':').next().unwrap_or("").trim();
+            return Err(format!("A variable in the \"{name}\" header has a line break, which a header cannot hold."));
+        }
+        header_lines.push(filled);
+    }
+    let headers_text = header_lines.join("\n");
     let bearer = r.apply(bearer_token.trim());
 
     let mut headers = parse_headers(&headers_text);
@@ -170,11 +183,24 @@ pub fn build_request(state: &PersistedState, bearer_token: &str) -> Result<Outgo
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
-                .map(|l| r.apply(l))
+                .map(|l| match l.split_once('=') {
+                    // a value with `&`, `=` or a line break must not become another field
+                    Some((key, value)) => format!("{}={}", r.apply(key), r.apply_with(value, encode_value)),
+                    None => r.apply(l),
+                })
                 .collect();
             OutgoingBody::Text(lines.join("&"))
         }
-        BodyMode::Raw => OutgoingBody::Text(r.apply(&state.raw_body)),
+        BodyMode::Raw => {
+            // A raw body that says it is JSON gets the same care as the JSON editor: values are escaped inside
+            // strings and `{{x?}}` can leave a member out. This is how an agent sends a body with an unquoted
+            // placeholder (`"labels": {{labels}}`), which is not a JSON value it could give as `json`.
+            let is_json = headers.iter().any(|(k, v)| {
+                let v = v.to_ascii_lowercase();
+                k.eq_ignore_ascii_case("content-type") && (v.contains("application/json") || v.contains("+json"))
+            });
+            OutgoingBody::Text(if is_json { r.apply_json(&state.raw_body) } else { r.apply(&state.raw_body) })
+        }
         BodyMode::Multipart => {
             // reqwest sets the header itself, with the generated boundary.
             headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
@@ -475,7 +501,7 @@ mod tests {
         assert_eq!(text_body(&build(&s, "")), Some("text a\nb \"q\""), "a raw body stays raw");
         s.body_mode = BodyMode::UrlEncoded;
         s.urlencoded_body = "k={{v}}".into();
-        assert_eq!(text_body(&build(&s, "")), Some("k=a\nb \"q\""));
+        assert_eq!(text_body(&build(&s, "")), Some("k=a%0Ab%20%22q%22"), "a form value is percent-encoded");
     }
 
     fn json_with(template: &str, vars: &[(&str, &str)]) -> Result<serde_json::Value, String> {
@@ -509,7 +535,7 @@ mod tests {
         let body = r#"{"fields": {"summary": "{{summary}}", "assignee": {"name": "{{who?}}"}, "epic": "{{epic?}}", "labels": {{labels?}}, "tags": ["a", "{{tag?}}", "b"]}}"#;
         // nothing given: the optional members are gone, the rest is untouched
         let p = json_with(body, &[("summary", "S")]).unwrap();
-        assert_eq!(p, serde_json::json!({"fields": {"summary": "S", "assignee": {}, "tags": ["a", "b"]}}));
+        assert_eq!(p, serde_json::json!({"fields": {"summary": "S", "tags": ["a", "b"]}}), "an object emptied by the omission goes too");
         // all given
         let p = json_with(body, &[("summary", "S"), ("who", "ann"), ("epic", "E-1"), ("labels", r#"["x","y"]"#), ("tag", "t")]).unwrap();
         assert_eq!(
@@ -548,6 +574,129 @@ mod tests {
         s.body_mode = BodyMode::Json;
         s.json_body = r#"{"x": "{{a}}", "y": {{d?}}}"#.into();
         assert_eq!(crate::engine::variables_used(&s), vec!["a", "b", "c", "d"]);
+    }
+
+    /// Values that have broken a request somewhere: line breaks, quotes, backslashes, separators of the
+    /// context they land in, control characters and non-ASCII text.
+    const NASTY: [&str; 12] = [
+        "line one\nline two",
+        "say \"hi\"",
+        "C:\\temp\\new",
+        "a&b=c",
+        "a?b#c",
+        "a b",
+        "tab\there",
+        "bell\u{7}",
+        "caf\u{e9} \u{65e5}\u{672c}",
+        "{{x}}",
+        "50%",
+        "",
+    ];
+
+    fn built_with(value: &str, setup: impl FnOnce(&mut PersistedState)) -> Result<OutgoingRequest, String> {
+        let mut s = state();
+        s.method = "POST".into();
+        s.variables = vec![var("v", value)];
+        setup(&mut s);
+        build_request(&s, "")
+    }
+
+    #[test]
+    fn a_value_never_changes_the_shape_of_the_url() {
+        for value in NASTY {
+            // path: it cannot start a query or a fragment, whatever it holds
+            let r = built_with(value, |s| s.url = "http://h/items/{{v}}/detail".into()).unwrap();
+            let url = reqwest::Url::parse(&r.url).unwrap_or_else(|e| panic!("{value:?} -> {} ({e})", r.url));
+            assert!(url.query().is_none() && url.fragment().is_none(), "{value:?} -> {}", r.url);
+            assert!(url.path().ends_with("/detail"), "{value:?} -> {}", r.url);
+            // the same with the whole origin in a variable
+            let r = built_with(value, |s| {
+                s.variables.push(var("base", "http://h:8080"));
+                s.url = "{{base}}/items/{{v}}".into();
+            })
+            .unwrap();
+            let url = reqwest::Url::parse(&r.url).unwrap_or_else(|e| panic!("{value:?} -> {} ({e})", r.url));
+            assert_eq!((url.host_str(), url.port(), url.query()), (Some("h"), Some(8080), None), "{value:?} -> {}", r.url);
+            // query: the value is one value, in one parameter
+            let r = built_with(value, |s| s.url = "http://h/s?a=1&q={{v}}&z=2".into()).unwrap();
+            let url = reqwest::Url::parse(&r.url).unwrap();
+            let pairs: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(pairs.len(), 3, "{value:?} -> {}", r.url);
+            assert_eq!(pairs[1], ("q".to_string(), value.to_string()), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_never_becomes_another_header() {
+        // a line break would start a new header line (header injection)
+        let err = built_with("ok\nX-Evil: 1", |s| s.headers_text = "X-Trace: {{v}}\nAccept: */*".into()).err().unwrap();
+        assert!(err.contains("X-Trace") && err.contains("line break"), "{err}");
+        // every other awkward value is a single header value, and the next header is untouched
+        for value in NASTY.iter().filter(|v| !v.contains('\n')) {
+            let r = built_with(value, |s| s.headers_text = "X-Trace: {{v}}\nAccept: */*".into()).unwrap();
+            assert!(r.headers.iter().any(|(k, v)| k == "Accept" && v == "*/*"), "{value:?}");
+            assert!(r.headers.iter().filter(|(k, _)| k.starts_with("X-")).count() == 1, "{value:?}: {:?}", r.headers);
+        }
+    }
+
+    #[test]
+    fn a_value_is_one_field_value_in_a_form_body() {
+        for value in NASTY {
+            let r = built_with(value, |s| {
+                s.body_mode = BodyMode::UrlEncoded;
+                s.urlencoded_body = "a=1\nname={{v}}\nz=2".into();
+            })
+            .unwrap();
+            let body = text_body(&r).unwrap();
+            let fields: Vec<(String, String)> = reqwest::Url::parse(&format!("http://h/?{body}"))
+                .unwrap()
+                .query_pairs()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(fields.len(), 3, "{value:?} -> {body}");
+            assert_eq!(fields[1], ("name".to_string(), value.to_string()), "{value:?} -> {body}");
+        }
+    }
+
+    #[test]
+    fn a_value_is_kept_exactly_in_json_raw_and_multipart_bodies() {
+        for value in NASTY {
+            let (_, parsed) = json_sent(r#"{"v": "{{v}}"}"#, value);
+            assert_eq!(parsed["v"], value, "json {value:?}");
+            let r = built_with(value, |s| {
+                s.body_mode = BodyMode::Raw;
+                s.raw_body = "<{{v}}>".into();
+            })
+            .unwrap();
+            assert_eq!(text_body(&r), Some(format!("<{value}>").as_str()), "raw {value:?}");
+            let r = built_with(value, |s| {
+                s.body_mode = BodyMode::Multipart;
+                s.multipart_fields = vec![FormField { key: "f".into(), kind: FieldKind::Text, value: "{{v}}".into(), enabled: true }];
+            })
+            .unwrap();
+            match &r.body {
+                OutgoingBody::Multipart(fields) => assert_eq!(fields[0].value, value, "multipart {value:?}"),
+                _ => panic!("not a multipart body"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_raw_body_that_says_it_is_json_is_filled_in_as_json() {
+        // how an agent sends a placeholder outside a string: `body` with a JSON content type
+        let mut s = state();
+        s.method = "POST".into();
+        s.variables = vec![var("v", "two\nlines"), var("l", r#"["a","b"]"#)];
+        s.headers_text = "Content-Type: application/json".into();
+        s.body_mode = BodyMode::Raw;
+        s.raw_body = r#"{"d": "{{v}}", "labels": {{l?}}, "epic": "{{epic?}}"}"#.into();
+        let r = build(&s, "");
+        let parsed: serde_json::Value = serde_json::from_str(text_body(&r).unwrap()).unwrap();
+        assert_eq!(parsed, serde_json::json!({"d": "two\nlines", "labels": ["a", "b"]}));
+        // without the content type it stays plain text
+        s.headers_text = "Content-Type: text/plain".into();
+        s.raw_body = "{{v}}".into();
+        assert_eq!(text_body(&build(&s, "")), Some("two\nlines"));
     }
 
     #[test]
