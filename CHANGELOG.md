@@ -10,6 +10,7 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 - The Auth tab is gone: Authorization is a header (`Authorization: Bearer {{token}}`). A Bearer token saved in the old tab becomes the secret variable `bearer` and is no longer added to every request behind your back. Ctrl+1 to Ctrl+4 now open Params, Headers, Body and Options (#192).
 
 ### Added
+- Export requests as HTTPie `http` commands, including form bodies, multipart files and TLS/redirect options, with `{{variables}}` kept as placeholders (#137).
 - Placeholders can have a default, `{{priority|Medium}}`, and can be optional, `{{epic?}}`: with no value, an optional one is left out of a JSON body (the member or array item goes) and is empty elsewhere. One request can create an issue with an optional assignee, labels and epic (#184).
 - Workflow steps can accept several statuses (`"expect_status": [200, 404]`) and can be conditional: `skip_if` leaves a step out and `stop_if` ends the run successfully, with `{{a}} == b`, `{{a}} != b` or a truthy value, and `{{previous_status}}` for the status before (#188).
 - A workflow `extract` can be `"scope": "run"`, kept for that run only, and `run_workflow` takes `cleanup: true` (`--cleanup` on the command line) to remove the variables a run stored, so values from old runs do not pile up (#189).
