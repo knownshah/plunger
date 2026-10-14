@@ -195,7 +195,9 @@ try:
     check("an adjusted timeout and an odd method are noted", res and len(res.get("problems", [])) >= 2, res and res.get("problems"))
 
     # 8. the audit log: every change is in it, in order, and tampering with it is found
-    mcp.call("set_variable", name="scenario_token", value="S3CR3T-VALUE-123")
+    err, _, text = mcp.call("set_variable", name="scenario_token", value="S3CR3T-VALUE-123")
+    # Linux has no credential store yet, so a secret cannot be kept there (and is refused, not stored in the open)
+    no_store = bool(err and "credential store" in text)
     mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=dict(auth, **{"X-Secret": "{{scenario_token}}"}))
     if mcp:
         mcp.proc.terminate()
@@ -216,7 +218,7 @@ try:
     sends = shown.get("entries", [])
     check("every send an agent made is in the log, with who sent it", len(sends) >= 10 and all(e["source"] == "mcp" for e in sends), len(sends))
     log_text = open(os.path.join(DATA, "audit.log"), encoding="utf-8").read()
-    check("no secret value is in the log", "S3CR3T-VALUE-123" not in log_text and "scenario_token" in log_text, "")
+    check("no secret value is in the log", "S3CR3T-VALUE-123" not in log_text and (no_store or "scenario_token" in log_text), text)
 
     # the database can be rebuilt from the log
     for name in os.listdir(DATA):
