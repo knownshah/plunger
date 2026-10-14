@@ -17,6 +17,7 @@ mod sidebar;
 mod tab;
 mod tabs;
 mod variables_window;
+mod workflow_flow;
 mod workflows;
 
 pub use tab::SavedTab;

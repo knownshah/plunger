@@ -5,6 +5,7 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 ## [Unreleased]
 
 ### Changed
+- A workflow's steps are drawn as a flow: a card per step on a rail of connected dots, the dots coloured by the last or running run (a diamond is a step that can be skipped, a square one that can end the run), the values a step hands to later ones written on the connector, and the values the workflow needs from outside listed on top.
 - The Variables window explains itself with a help icon instead of a paragraph.
 - Variables are no longer a tab in every request, because they are shared by all requests, the command line and agents. **Tools > Variables** opens them in a window, and each request shows only the ones it uses under the URL (`Uses base = https://..., token = [secret]`). A request opened from the history shows the values it was sent with (non-secret ones; a secret is never kept) (#191).
 - The Auth tab is gone: Authorization is a header (`Authorization: Bearer {{token}}`). A Bearer token saved in the old tab becomes the secret variable `bearer` and is no longer added to every request behind your back. Ctrl+1 to Ctrl+4 now open Params, Headers, Body and Options (#192).

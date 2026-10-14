@@ -72,7 +72,7 @@ fn parse_values(text: &str) -> BTreeMap<String, String> {
 }
 
 /// "POST {{base}}/login" or the saved request's name.
-fn step_title(step: &Step) -> (String, String) {
+pub(super) fn step_title(step: &Step) -> (String, String) {
     match (&step.request.saved_request, &step.request.url) {
         (Some(saved), None) => ("SAVED".to_string(), saved.clone()),
         (_, url) => (
@@ -453,72 +453,20 @@ impl ApiTesterApp {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.label(egui::RichText::new("STEPS").small().strong().color(ui.visuals().weak_text_color()));
-                egui::ScrollArea::vertical().id_salt("workflow-steps").max_height(250.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, step) in steps.iter().enumerate() {
-                        let (method, target) = step_title(step);
-                        ui.horizontal(|ui| {
-                            // a dot for the live state of this step while it runs
-                            match live.as_ref().and_then(|l| l.get(i)) {
-                                Some((Some(done), _)) => dot(ui, if done.ok { palette().ok } else { palette().error }, true),
-                                Some((None, true)) => {
-                                    ui.add(egui::Spinner::new().size(10.0));
-                                }
-                                Some((None, false)) => dot(ui, ui.visuals().weak_text_color(), false),
-                                None => {}
-                            }
-                            ui.label(egui::RichText::new(format!("{}", i + 1)).weak());
-                            let label = step.label.clone().unwrap_or_default();
-                            if !label.is_empty() {
-                                ui.label(egui::RichText::new(label).strong());
-                            }
-                            ui.label(egui::RichText::new(method).monospace().color(palette().accent_text));
-                            ui.add(egui::Label::new(egui::RichText::new(target).monospace()).truncate());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("Open as request").on_hover_text("Open this step in a tab, to try it by hand").clicked() {
-                                    open_step = Some(i);
-                                }
-                            });
-                        });
-                        let mut notes: Vec<String> = Vec::new();
-                        if let Some(headers) = &step.request.headers {
-                            if !headers.is_empty() {
-                                notes.push(format!("headers: {}", headers.keys().cloned().collect::<Vec<_>>().join(", ")));
-                            }
-                        }
-                        if step.request.json.is_some() || step.request.body.is_some() || step.request.form.is_some() {
-                            notes.push("with a body".to_string());
-                        }
-                        for e in &step.request.extract {
-                            notes.push(format!("keeps {} from {}{}", e.name, e.from, if e.secret == Some(true) { " (secret)" } else { "" }));
-                        }
-                        if let Some(want) = &step.expect_status {
-                            notes.push(format!("expects {}", want.describe()));
-                        }
-                        if let Some(condition) = &step.skip_if {
-                            notes.push(format!("skipped if {condition}"));
-                        }
-                        if let Some(condition) = &step.stop_if {
-                            notes.push(format!("stops the run if {condition}"));
-                        }
-                        if !notes.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(22.0);
-                                ui.add(egui::Label::new(egui::RichText::new(notes.join("  \u{b7}  ")).weak().small()).wrap());
-                            });
-                        }
-                        // the result of this step in the run in progress
-                        if let Some((Some(done), _)) = live.as_ref().and_then(|l| l.get(i)) {
-                            if let Some(error) = &done.error {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(22.0);
-                                    ui.colored_label(palette().error, error);
-                                });
-                            }
-                        }
-                        ui.add_space(4.0);
-                    }
+                // the steps as a flow: the dots show the run in progress, or else the one chosen below
+                let shown_run = view.selected.and_then(|id| view.runs.iter().find(|r| r.id == id)).or_else(|| view.runs.first());
+                let stored_steps: Vec<StoredStep> = shown_run.map(|r| serde_json::from_str(&r.steps).unwrap_or_default()).unwrap_or_default();
+                let states: Vec<super::workflow_flow::NodeState> = (0..steps.len())
+                    .map(|i| match live.as_ref().and_then(|l| l.get(i)) {
+                        Some((Some(done), _)) => super::workflow_flow::NodeState::from_stored(done),
+                        Some((None, true)) => super::workflow_flow::NodeState::Running,
+                        Some((None, false)) => super::workflow_flow::NodeState::Idle,
+                        None => stored_steps.get(i).map_or(super::workflow_flow::NodeState::Idle, super::workflow_flow::NodeState::from_stored),
+                    })
+                    .collect();
+                egui::ScrollArea::vertical().id_salt("workflow-steps").max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    super::workflow_flow::render(ui, &steps, &states, &mut open_step);
                 });
-
                 ui.add_space(4.0);
                 ui.separator();
                 ui.label(egui::RichText::new("LAST RUN").small().strong().color(ui.visuals().weak_text_color()));
