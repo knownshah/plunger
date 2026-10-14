@@ -5,6 +5,7 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 ## [Unreleased]
 
 ### Added
+- File > Copy as and File > Export request can write a request as a JavaScript `fetch` call that runs in Node.js 18+. A JSON body becomes `JSON.stringify({...})`, and `{{variables}}` stay as placeholders.
 - `select` and `extract` understand a filter, `[?(@.name=='Done')]` (equality only), so an item can be found by name in one call (#183). With `select`, the response headers are left out (#182), a path through a `null` is `null` instead of a problem (#187), and when a path cannot be read the whole response is returned with the reason instead of nothing (#186).
 
 ### Fixed
