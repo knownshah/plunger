@@ -35,7 +35,9 @@ pub struct SendParams {
     #[serde(default)]
     pub url: Option<String>,
     /// Request headers, e.g. {"Accept": "application/json", "Authorization": "Bearer {{token}}"}.
-    #[serde(default)]
+    /// A list of {"name", "value"} objects or "Name: value" strings is accepted too.
+    #[serde(default, deserialize_with = "lenient_headers")]
+    #[schemars(with = "Option<BTreeMap<String, String>>")]
     pub headers: Option<BTreeMap<String, String>>,
     /// A JSON body (any JSON value). Sent with Content-Type: application/json.
     #[serde(default)]
@@ -73,6 +75,60 @@ pub struct SendParams {
     /// keeps the array items whose field equals the value. If a path cannot be read, the whole response is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<Vec<String>>,
+    /// Fields this version does not know. They are refused by name, never ignored, so a request that
+    /// asks for something Plunger cannot do (`retries`) fails loudly instead of quietly not doing it.
+    #[serde(flatten, default, skip_serializing)]
+    #[schemars(skip)]
+    pub unknown_fields: BTreeMap<String, serde_json::Value>,
+}
+
+/// The names of the fields of [`SendParams`], for the message that refuses an unknown one.
+const SEND_FIELDS: &str = "saved_request, method, url, headers, json, body, form, variables, use_saved_bearer, \
+timeout_secs, follow_redirects, insecure_tls, max_body_chars, extract, select";
+
+/// `headers` as an object, a list of {"name", "value"} (or {"key", "value"}) objects, or a list of
+/// "Name: value" strings: the shapes an agent tends to produce.
+fn lenient_headers<'de, D>(deserializer: D) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    let bad = || D::Error::custom("`headers` is an object like {\"Accept\": \"application/json\"}; a list of {\"name\", \"value\"} objects or \"Name: value\" strings also works");
+    let Some(value) = value else { return Ok(None) };
+    let mut out = BTreeMap::new();
+    match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.insert(k, text(&v).ok_or_else(bad)?);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                match item {
+                    serde_json::Value::String(line) => {
+                        let (k, v) = line.split_once(':').ok_or_else(bad)?;
+                        out.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                    serde_json::Value::Object(map) => {
+                        let name = map.get("name").or_else(|| map.get("key")).and_then(text).ok_or_else(bad)?;
+                        let value = map.get("value").and_then(text).ok_or_else(bad)?;
+                        out.insert(name, value);
+                    }
+                    _ => return Err(bad()),
+                }
+            }
+        }
+        _ => return Err(bad()),
+    }
+    Ok(Some(out))
 }
 
 /// Merges `extra` headers into `headers_text`, replacing same-named ones.
@@ -91,7 +147,23 @@ impl SendParams {
         if given > 1 {
             return Err("Give only one of `json`, `body` or `form`.".into());
         }
+        if let Some(form) = &self.form {
+            // `@path` means "upload this file" to curl; over MCP it would only be sent as the text `@path`
+            if let Some((field, value)) = form.iter().find(|(_, v)| v.starts_with('@') && v.contains(['/', '\\', '.'])) {
+                return Err(format!(
+                    "`form` value for `{field}` is `{value}`, which looks like a file to upload. Plunger's MCP `form` sends \
+                     text only (it would send the characters `@...`). Upload with the window or `plunger send --form`, \
+                     or send the content as text in `body`."
+                ));
+            }
+        }
         Ok(match (&self.json, &self.body, &self.form) {
+            // an agent often gives the JSON as a string: that is the body it meant, not a JSON string value
+            (Some(serde_json::Value::String(text)), _, _)
+                if serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v.is_object() || v.is_array()) =>
+            {
+                Body::Json(text.trim().to_string())
+            }
             (Some(v), _, _) => Body::Json(serde_json::to_string(v).map_err(|e| e.to_string())?),
             (_, Some(text), _) => Body::Text(text.clone()),
             (_, _, Some(form)) => Body::Form(form.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
@@ -120,6 +192,14 @@ impl SendParams {
     }
 
     pub(crate) fn to_state(&self, session: &Session, history: &History) -> Result<PersistedState, String> {
+        if !self.unknown_fields.is_empty() {
+            let names: Vec<&str> = self.unknown_fields.keys().map(String::as_str).collect();
+            return Err(format!(
+                "Unknown field{} `{}`: Plunger has no such option, so it was not sent. Fields: {SEND_FIELDS}.",
+                if names.len() == 1 { "" } else { "s" },
+                names.join("`, `")
+            ));
+        }
         let body = self.body()?;
         if let Some(h) = &self.headers {
             crate::domain::request::check_header_lines(h.iter())?;
@@ -308,6 +388,16 @@ fn send_prepared_raw(
     match engine::send(state, bearer, Some(history), source) {
         Ok(sent) => {
             let mut shaped = AgentResponse::from_sent(&sent, &scrubber, max_body_chars);
+            // things that were quietly adjusted are said, so an agent does not rely on what did not happen
+            if let Some(t) = params.timeout_secs.filter(|t| !(1..=600).contains(t)) {
+                shaped.problems.push(format!("timeout_secs {t} is outside 1 to 600, so {} was used", t.clamp(1, 600)));
+            }
+            if let Some(m) = params.method.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                const STANDARD: [&str; 9] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"];
+                if !STANDARD.contains(&m.to_ascii_uppercase().as_str()) {
+                    shaped.problems.push(format!("`{m}` is not a standard HTTP method; it was sent as written"));
+                }
+            }
             if let Some(paths) = &params.select {
                 apply_select(&mut shaped, &sent.response, paths, &scrubber);
             }
@@ -316,10 +406,16 @@ fn send_prepared_raw(
         Err(SendError::Refused(msg)) => {
             // The window's advice ("define it in Tools > Variables") isn't
             // something an agent can do; say how it can supply one instead.
-            let hint = if msg.starts_with("Undefined variable") {
-                " An agent can pass a value for this request: `variables` in MCP, `--var name=value` on the command line."
+            // the window's advice ("define it in Tools > Variables") is dropped for an agent
+            let (msg, hint) = if msg.starts_with("Undefined variable") {
+                let cut = msg.find(" Define ").map_or(msg.as_str(), |at| &msg[..at]);
+                (
+                    cut.to_string(),
+                    " Pass a value for this request: `variables` in MCP, `--var name=value` on the command line; set it for later requests with set_variable. \
+                     `{{name?}}` makes it optional and `{{name|default}}` gives a fallback.",
+                )
             } else {
-                ""
+                (msg, "")
             };
             Err(SendFailure::NotSent(format!("{}{hint}", scrubber.text(&msg))))
         }
@@ -714,5 +810,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_shapes_an_agent_gets_wrong_are_understood_or_refused_by_name() {
+        let h = History::in_memory();
+        let session = plain_session();
+        let parse = |v: serde_json::Value| serde_json::from_value::<SendParams>(v);
+
+        // headers: an object, a list of name/value objects, a list of "Name: value" strings
+        let expected = Some(BTreeMap::from([("Accept".to_string(), "application/json".to_string())]));
+        for headers in [
+            serde_json::json!({"Accept": "application/json"}),
+            serde_json::json!([{"name": "Accept", "value": "application/json"}]),
+            serde_json::json!([{"key": "Accept", "value": "application/json"}]),
+            serde_json::json!(["Accept: application/json"]),
+        ] {
+            assert_eq!(parse(serde_json::json!({"url": "http://h", "headers": headers})).unwrap().headers, expected);
+        }
+        let err = parse(serde_json::json!({"url": "http://h", "headers": "Accept: x"})).unwrap_err().to_string();
+        assert!(err.contains("headers"), "{err}");
+
+        // json given as a string that holds an object or array is that body
+        let from_string = parse(serde_json::json!({"url": "http://h", "json": "{\"a\": 1}"})).unwrap();
+        assert_eq!(from_string.body().unwrap(), Body::Json("{\"a\": 1}".into()));
+        // a string that is not JSON stays a JSON string
+        let text = parse(serde_json::json!({"url": "http://h", "json": "hello"})).unwrap();
+        assert_eq!(text.body().unwrap(), Body::Json("\"hello\"".into()));
+
+        // a field Plunger does not have is named, and nothing is sent
+        let unknown = parse(serde_json::json!({"url": "http://h", "retries": 3, "backoff": true})).unwrap();
+        let err = unknown.to_state(&session, &h).err().unwrap();
+        assert!(err.contains("`retries`") && err.contains("`backoff`") && err.contains("select"), "{err}");
+
+        // a form value that is a file to upload is refused; other text beginning with @ is text
+        let upload = parse(serde_json::json!({"url": "http://h", "form": {"f": "@C:/data/report.csv"}})).unwrap();
+        assert!(upload.body().unwrap_err().contains("upload"));
+        let mention = parse(serde_json::json!({"url": "http://h", "form": {"who": "@ann"}})).unwrap();
+        assert!(mention.body().is_ok());
     }
 }

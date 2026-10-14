@@ -41,6 +41,8 @@ pub enum Icon {
     Expand,
     /// Two arrows pointing in: this panel fills the window; click to share it again.
     Collapse,
+    /// A question mark in a circle: hover for the explanation, so a window does not spend a paragraph on it.
+    Help,
 }
 
 pub const SIZE: f32 = 28.0;
@@ -49,6 +51,20 @@ pub const SIZE: f32 = 28.0;
 /// spacing before each and the padding a text field adds outside its width.
 pub fn trailing_room(ui: &egui::Ui, n: usize) -> f32 {
     n as f32 * (SIZE + ui.spacing().item_spacing.x) + crate::ui::theme::FIELD_MARGIN_X + 2.0
+}
+
+/// A small help icon: the explanation is its hover text, not a paragraph in the window.
+pub fn help(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let size = 20.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() { palette().accent_text } else { ui.visuals().weak_text_color() };
+        paint(ui.painter(), rect.shrink(3.0), Icon::Help, color);
+    }
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(360.0);
+        ui.label(text);
+    })
 }
 
 /// A square, borderless icon button that lights up on hover.
@@ -130,6 +146,12 @@ pub fn paint(painter: &egui::Painter, r: egui::Rect, icon: Icon, color: egui::Co
             .collect::<Vec<_>>()
     };
     match icon {
+        Icon::Help => {
+            painter.circle_stroke(p(7.0, 7.0), 6.4 * s, stroke);
+            // the hook of the question mark, its stem and the dot
+            line(arc(7.0, 5.4, 2.0, 180.0, 450.0).into_iter().chain([p(7.0, 8.4)]).collect());
+            painter.circle_filled(p(7.0, 10.3), 0.8 * s, color);
+        }
         Icon::Copy => {
             // Front page, plus the visible edges of the page behind it.
             painter.rect_stroke(

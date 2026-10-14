@@ -5,6 +5,7 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 ## [Unreleased]
 
 ### Changed
+- The Variables window explains itself with a help icon instead of a paragraph.
 - Variables are no longer a tab in every request, because they are shared by all requests, the command line and agents. **Tools > Variables** opens them in a window, and each request shows only the ones it uses under the URL (`Uses base = https://..., token = [secret]`). A request opened from the history shows the values it was sent with (non-secret ones; a secret is never kept) (#191).
 - The Auth tab is gone: Authorization is a header (`Authorization: Bearer {{token}}`). A Bearer token saved in the old tab becomes the secret variable `bearer` and is no longer added to every request behind your back. Ctrl+1 to Ctrl+4 now open Params, Headers, Body and Options (#192).
 
@@ -17,6 +18,8 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 - `select` and `extract` understand a filter, `[?(@.name=='Done')]` (equality only), so an item can be found by name in one call (#183). With `select`, the response headers are left out (#182), a path through a `null` is `null` instead of a problem (#187), and when a path cannot be read the whole response is returned with the reason instead of nothing (#186).
 
 ### Fixed
+- An agent's common mistakes are understood or refused by name instead of failing oddly or being ignored: `headers` as a list of `{name, value}` objects or `"Name: value"` strings (#89); `json` given as a string that holds a JSON object; an unknown field such as `retries` is refused with the list of real ones; a `form` value that is a file path (`@C:/x.txt`) is refused with how to upload (#108); a `timeout_secs` outside 1 to 600 and a non-standard method are noted in `problems`; the undefined-variable message tells an agent what it can do rather than pointing at the window.
+- Under the URL, a placeholder that is optional (`{{who?}}`) or has a default (`{{x|dflt}}`) is no longer shown as undefined.
 - A value could change the shape of a request outside a JSON body. In a header, a line break started another header; in a form body, `&` or `=` added fields; in a URL path, `?` or `#` began a query or fragment. A header value with a line break is now refused, form values are percent-encoded and path values keep `?`, `#`, spaces and control characters from changing the URL (#190).
 - A raw body sent with a JSON content type (how an agent sends `"labels": {{labels}}`, which is not a JSON value it could pass as `json`) is filled in as JSON: values are escaped and optional members can be left out. `--json` on the command line accepts a body with such placeholders (#190).
 - An object that an optional placeholder leaves empty is removed with it (`"assignee": {"name": "{{who?}}"}`).

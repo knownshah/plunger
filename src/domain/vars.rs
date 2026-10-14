@@ -152,6 +152,21 @@ impl<'a> Resolver<'a> {
 /// themselves in (`$uuid`, ...) are left out; an environment variable is listed as `$env:NAME`
 /// because it must be set when the request is sent.
 pub fn variables_used(state: &PersistedState) -> Vec<String> {
+    placeholders_used(state).into_iter().map(|p| p.name).collect()
+}
+
+/// A `{{placeholder}}` a request uses, with what its marks say.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsedPlaceholder {
+    pub name: String,
+    /// `{{name|default}}`
+    pub default: Option<String>,
+    /// `{{name?}}`
+    pub optional: bool,
+}
+
+/// The placeholders of a request, in order of first use (see [`variables_used`]).
+pub fn placeholders_used(state: &PersistedState) -> Vec<UsedPlaceholder> {
     let mut texts = vec![state.url.as_str(), state.headers_text.as_str()];
     match state.body_mode {
         BodyMode::Json => texts.push(&state.json_body),
@@ -159,7 +174,7 @@ pub fn variables_used(state: &PersistedState) -> Vec<String> {
         BodyMode::UrlEncoded => texts.push(&state.urlencoded_body),
         BodyMode::Multipart | BodyMode::None => {}
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<UsedPlaceholder> = Vec::new();
     for field in &state.multipart_fields {
         collect_names(&field.value, &mut names);
     }
@@ -169,19 +184,24 @@ pub fn variables_used(state: &PersistedState) -> Vec<String> {
     names
 }
 
-fn collect_names(text: &str, names: &mut Vec<String>) {
+fn collect_names(text: &str, names: &mut Vec<UsedPlaceholder>) {
     let mut rest = text;
     while let Some(start) = rest.find("{{") {
         let after = &rest[start + 2..];
         let Some(end) = after.find("}}") else { return };
-        let name = crate::domain::vars::parse_placeholder(&after[..end]).name;
+        let placeholder = parse_placeholder(&after[..end]);
+        let name = placeholder.name;
         let is_env = name.strip_prefix("$env:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         let valid = is_env
             || (!name.is_empty()
                 && !name.starts_with('$')
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'));
-        if valid && !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
+        if valid && !names.iter().any(|n| n.name == name) {
+            names.push(UsedPlaceholder {
+                name: name.to_string(),
+                default: placeholder.default.map(str::to_string),
+                optional: placeholder.optional,
+            });
         }
         rest = &after[end + 2..];
     }

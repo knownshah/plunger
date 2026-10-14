@@ -25,18 +25,17 @@ impl ApiTesterApp {
             .default_height(420.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Shared by every request, the command line and agents. Use {{name}} in a URL, a header or a body. \
-                         Built-ins: {{$uuid}}, {{$timestamp}}, {{$randomInt}} and {{$env:NAME}}. \
-                         {{name|default}} has a fallback and {{name?}} may be missing. \
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Shared by every request and agent").weak().small());
+                    crate::ui::icons::help(
+                        ui,
+                        "Use {{name}} in a URL, a header or a body.\n\
+                         Built-ins: {{$uuid}}, {{$timestamp}}, {{$randomInt}} and {{$env:NAME}}.\n\
+                         {{name|default}} has a fallback; {{name?}} may be missing (left out of a JSON body).\n\n\
                          Secret values (lock on, or a name like token or password) are never written to a file; \
                          turn on the key to keep one in the system credential store.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                ui.add_space(6.0);
+                    );
+                });
                 let secrets_error = self.secrets_error.clone();
                 let tab = &mut self.tabs[self.active];
                 forget = tab.render_variables_tab(ui, secrets_error.as_deref(), &self.agent_variables, &mut delete_agent);
@@ -57,16 +56,28 @@ impl ApiTesterApp {
     /// the values that request was actually sent with.
     pub(super) fn render_uses_line(&mut self, ui: &mut egui::Ui) {
         let tab = &self.tabs[self.active];
-        let names = crate::engine::variables_used(&tab.state);
+        let names = crate::domain::vars::placeholders_used(&tab.state);
         if names.is_empty() {
             return;
         }
         let sent = &tab.sent_values;
+        let p = palette();
         let mut open_window = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(if sent.is_empty() { "Uses" } else { "Sent with" }).weak().small());
-            for name in names.iter().take(USES_SHOWN) {
-                let (text, color) = self.describe_value(name, sent);
+            for used in names.iter().take(USES_SHOWN) {
+                let name = &used.name;
+                let (mut text, mut color) = self.describe_value(name, sent);
+                // a placeholder that may be missing is not a problem when it is
+                if text == "undefined" {
+                    if let Some(default) = &used.default {
+                        text = format!("default {}", one_line_value(default));
+                        color = p.text;
+                    } else if used.optional {
+                        text = "optional, left out".to_string();
+                        color = ui.visuals().weak_text_color();
+                    }
+                }
                 let label = egui::Label::new(egui::RichText::new(format!("{name} = {text}")).monospace().small().color(color)).sense(egui::Sense::click());
                 if ui.add(label).on_hover_text("Open the variables").clicked() {
                     open_window = true;
