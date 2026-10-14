@@ -90,6 +90,9 @@ pub struct VariableFull {
 pub struct Snapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The hash of the last entry of the log file this one continues (after a rotation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
     pub requests: Vec<RequestFull>,
     pub workflows: Vec<WorkflowFull>,
     pub runs: Vec<RunFull>,
@@ -370,7 +373,9 @@ pub fn verify(path: &Path) -> Result<(u64, String), Broken> {
                 return Err(Broken { seq: want, reason: format!("expected entry {want}, found {}: an entry was removed or reordered", entry.seq) });
             }
         }
-        if entry.prev != prev {
+        // the first line follows nothing, or is the snapshot that continues an archived file
+        let continues_archive = count == 0 && matches!(&entry.event, Event::Snapshot(s) if s.continues.as_deref() == Some(entry.prev.as_str()));
+        if entry.prev != prev && !continues_archive {
             return Err(Broken { seq: entry.seq, reason: "it does not follow the entry before it".to_string() });
         }
         if !entry.is_sound() {
@@ -553,7 +558,17 @@ pub fn snapshot_of(conn: &Connection, note: Option<String>) -> rusqlite::Result<
             Ok(VariableFull { name: r.get(0)?, value: r.get(1)?, secret: r.get(2)?, source: r.get(3)?, updated_at: r.get(4)? })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Snapshot { note, requests, workflows, runs, variables })
+    Ok(Snapshot { note, continues: None, requests, workflows, runs, variables })
+}
+
+/// A log file is moved aside and a new one started when it passes this size.
+pub const ROTATE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Moves the log to `audit.<last seq>.log` beside it. The next entry starts the new file.
+pub fn archive(path: &Path, last_seq: u64) -> std::io::Result<PathBuf> {
+    let target = path.with_file_name(format!("audit.{last_seq}.log"));
+    std::fs::rename(path, &target)?;
+    Ok(target)
 }
 
 /// The log file that belongs to a database file.
@@ -808,5 +823,43 @@ mod tests {
         assert!(!text.contains("SUPERSECRET"), "a secret reached the log: {text}");
         assert!(text.contains("{{trace}}"), "placeholders are kept");
         assert!(text.contains("api_token"));
+    }
+
+    #[test]
+    fn a_large_log_is_kept_aside_and_the_new_one_continues_the_chain() {
+        let db = scratch("rotate");
+        let h = History::open_at(&db).rotate_at(6_000);
+        for i in 0..40 {
+            h.insert_from(&state(&format!("http://h/{i}")), Some(200), Some(1), Source::Mcp).unwrap();
+        }
+        let log = path_for(&db);
+        let dir = log.parent().unwrap();
+        let archives: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("audit.") && n != "audit.log" && n.ends_with(".log") && !n.contains("sqlite3"))
+            .collect();
+        assert!(!archives.is_empty(), "the log was rotated: {archives:?}");
+
+        // the current file verifies on its own because its first line says what it continues
+        let (_, head) = verify(&log).unwrap();
+        let first = lines(&db).remove(0);
+        match &first.event {
+            Event::Snapshot(s) => {
+                assert!(s.continues.is_some() && s.note.as_deref().is_some_and(|n| n.contains("continues")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // and so does every archive
+        for name in &archives {
+            assert!(verify(&dir.join(name)).is_ok(), "{name}");
+        }
+        // all rows are still there, and the database can be rebuilt from the files that remain
+        assert_eq!(h.search_recent("", 100).unwrap().len(), 40);
+        assert!(!head.is_empty());
+        let before = h.search_recent("", 100).unwrap().len();
+        h.rebuild_from_log().unwrap();
+        assert_eq!(h.search_recent("", 100).unwrap().len(), before, "a snapshot carries what was before it");
     }
 }

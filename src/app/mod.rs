@@ -222,15 +222,24 @@ impl ApiTesterApp {
             return;
         }
         let session = self.tabs[0].state.clone();
-        self.tabs = open_tabs
-            .tabs
-            .into_iter()
-            .map(|mut saved| {
-                saved.state = saved.state.with_session_from(&session);
-                self.next_tab_id += 1;
-                Tab::from_saved(self.next_tab_id, saved)
-            })
-            .collect();
+        let mut tabs = Vec::new();
+        for mut saved in open_tabs.tabs {
+            saved.state = saved.state.with_session_from(&session);
+            self.next_tab_id += 1;
+            let mut tab = Tab::from_saved(self.next_tab_id, saved);
+            // a request that came from the history still says how it went, from its row
+            if let Some(entry) = tab.history_id.and_then(|id| self.history.as_ref().and_then(|h| h.get(id).ok().flatten())) {
+                tab.opened_from = Some(tab::HistoryMeta {
+                    created_at: entry.created_at.clone(),
+                    status: entry.status,
+                    elapsed_ms: entry.elapsed_ms,
+                    source: entry.source,
+                });
+                tab.sent_values = entry.sent_values.clone();
+            }
+            tabs.push(tab);
+        }
+        self.tabs = tabs;
         self.active = open_tabs.active.min(self.tabs.len() - 1);
     }
 

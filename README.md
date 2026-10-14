@@ -7,7 +7,9 @@
 </p>
 
 <p align="center">
-  A tiny native API inspection tool for developers who just want to see what their pipeline is actually doing.<br>
+  An HTTP client built for AI agents. An MCP server and a command line that send requests safely (a secret never reaches the output,
+  an undefined variable is refused), return only the values the agent asked for, and write every change to a tamper-evident log,
+  plus a small native window to see and check what the agent did.<br>
   Make the request. See the JSON. Move on.
 </p>
 

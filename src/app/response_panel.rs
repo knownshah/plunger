@@ -40,12 +40,14 @@ impl Tab {
                         }
                         if let Some(meta) = &self.opened_from {
                             // Opened from the history: say how it went; the response itself is not stored.
+                            // A request that was only saved, never sent, has no status and no time: say so.
+                            let never_sent = meta.status.is_none() && meta.elapsed_ms.is_none();
                             ui.horizontal(|ui| {
                                 // Centre the line: the badge, then who sent it and when.
                                 ui.add_space(((ui.available_width() - 330.0) / 2.0).max(0.0));
                                 if let Some(status) = meta.status {
                                     status_badge(ui, status as u16, "");
-                                } else {
+                                } else if !never_sent {
                                     ui.label(egui::RichText::new("no response").color(crate::ui::theme::palette().error));
                                 }
                                 let by = match meta.source {
@@ -54,9 +56,11 @@ impl Tab {
                                     crate::store::history::Source::Mcp => "an agent (MCP)",
                                 };
                                 let time = meta.elapsed_ms.map(|ms| format!(" · {ms} ms")).unwrap_or_default();
-                                ui.label(egui::RichText::new(format!("Sent by {by} {}{time}", crate::domain::timefmt::full(&meta.created_at))).weak());
+                                let verb = if never_sent { "Saved" } else { "Sent" };
+                                ui.label(egui::RichText::new(format!("{verb} by {by} {}{time}", crate::domain::timefmt::full(&meta.created_at))).weak());
                             });
-                            ui.label(egui::RichText::new("The response is not stored. Ctrl+Enter sends it again").weak().small());
+                            let note = if never_sent { "Not sent yet. Ctrl+Enter sends it" } else { "The response is not stored. Ctrl+Enter sends it again" };
+                            ui.label(egui::RichText::new(note).weak().small());
                         } else {
                             ui.label(egui::RichText::new("Send a request to see the response here").weak());
                             ui.label(egui::RichText::new("Ctrl+Enter sends from anywhere").weak().small());

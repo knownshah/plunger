@@ -8,6 +8,7 @@ that is the surface an agent uses: JSON-RPC arguments, tool results, structured 
 real use found problems our unit tests did not: text with line breaks and quotes in a JSON body, optional
 fields, error pages that are not JSON, nulls, saved requests, and the shapes an agent gets wrong.
 """
+import hashlib
 import json
 import os
 import socket
@@ -194,6 +195,20 @@ try:
     err, res, text = mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=auth, timeout_secs=0, method="FETCH")
     check("an adjusted timeout and an odd method are noted", res and len(res.get("problems", [])) >= 2, res and res.get("problems"))
 
+    # 7b. what comes back: ttfb, where a redirect went, a binary checked without its bytes, which headers
+    err, moved, _ = mcp.call("send_request", url=f"{BASE}/old", headers=auth)
+    check("a redirect says where it went", moved and moved.get("final_url", "").endswith("/search?jql=moved")
+          and [r["status"] for r in moved.get("redirects", [])] == [301] and moved.get("ttfb_ms") is not None, moved)
+    err, plain, _ = mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=auth)
+    check("no redirect fields when there was none", plain and "redirects" not in plain and "final_url" not in plain, plain)
+    err, relevant, _ = mcp.call("send_request", url=f"{BASE}/old", headers=auth, include_headers="relevant", follow_redirects=False)
+    names = [h["name"].lower() for h in (relevant or {}).get("headers", [])]
+    check("include_headers: relevant keeps location and drops the rest", "location" in names and "server" not in names and "date" not in names, names)
+    err, blob, _ = mcp.call("send_request", url=f"{BASE}/blob", headers=auth)
+    expected = hashlib.sha256(b"\x89PNG\r\n\x1a\n" + bytes(64)).hexdigest()
+    check("a binary body is checked, not returned", blob and blob.get("binary") and blob.get("sha256") == expected
+          and blob.get("detected_type") == "png" and "json" not in blob and "body" not in blob, blob)
+
     # 8. the audit log: every change is in it, in order, and tampering with it is found
     err, _, text = mcp.call("set_variable", name="scenario_token", value="S3CR3T-VALUE-123")
     # Linux has no credential store yet, so a secret cannot be kept there (and is refused, not stored in the open)
@@ -212,6 +227,10 @@ try:
         except ValueError:
             return r.returncode, {"_raw": r.stdout}
 
+    out_file = os.path.join(DATA, "body.out")
+    code, written = plunger("send", "--url", f"{BASE}/search?jql=whole", "-H", "Authorization: Bearer tok_tracker", "--out", out_file)
+    check("--out writes the whole body to a file", code == 0 and written.get("body_file") == out_file
+          and "whole" in open(out_file, encoding="utf-8").read() and "json" not in written, written)
     code, verified = plunger("audit", "verify")
     check("the audit log verifies", code == 0 and verified.get("ok") and verified.get("entries", 0) > 20, verified)
     code, shown = plunger("audit", "show", "--source", "mcp", "--action", "send", "--limit", "500")

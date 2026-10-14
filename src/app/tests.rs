@@ -645,7 +645,7 @@ fn naming_a_history_row_saves_it_and_titles_its_tab() {
     let mut a = app(PersistedState { url: String::new(), ..Default::default() });
     let e = entry(&a, "http://h/fixtures/1");
     a.open_entry(&e);
-    assert_eq!(a.tab().title(), "1");
+    assert_eq!(a.tab().title(), "fixtures/1");
     a.start_rename(&e, "history");
     draw(&mut a);
     a.commit_rename(e.id, "  Fixture one ");
@@ -654,7 +654,7 @@ fn naming_a_history_row_saves_it_and_titles_its_tab() {
     assert_eq!(a.tab().saved_id, Some(e.id));
     a.unsave(e.id);
     assert!(a.saved_entries.is_empty());
-    assert_eq!(a.tab().title(), "1");
+    assert_eq!(a.tab().title(), "fixtures/1");
 }
 
 #[test]

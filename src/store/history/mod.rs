@@ -248,6 +248,8 @@ pub struct History {
     conn: Connection,
     /// The audit log this database is the result of; None for a database that lives only in memory.
     log_path: Option<PathBuf>,
+    /// The size at which the log is moved aside and started again.
+    rotate_at: u64,
 }
 
 const COLUMNS: &str = "id, created_at, method, url, headers_text, body_mode, json_body, urlencoded_body, raw_body, \
@@ -453,7 +455,7 @@ impl History {
                  SELECT RAISE(ABORT, 'a saved request with this exact name already exists');
              END;",
         )?;
-        let history = Self { conn, log_path };
+        let history = Self { conn, log_path, rotate_at: log::ROTATE_BYTES };
         // rows from before redaction existed are cleaned first, so the log never holds a credential
         history.scrub_credentials()?;
         history.init_log()?;
@@ -497,6 +499,7 @@ impl History {
         };
         // lines another process appended and did not apply (it stopped in between)
         self.catch_up(&mut state)?;
+        self.rotate_if_large(&mut state)?;
         let mut id = 0;
         match event {
             Event::RequestAdded { id: slot, .. } => {
@@ -515,6 +518,28 @@ impl History {
         self.append_entry(&mut state, event.clone())?;
         log::write_state(&self.conn, &state)?;
         Ok(Committed { id, changed: applied.changed })
+    }
+
+    /// A log that has grown past `rotate_at` is kept as `audit.<seq>.log` and a new one is started with a
+    /// snapshot that names the hash it continues, so the chain stays verifiable across the files.
+    fn rotate_if_large(&self, state: &mut log::State) -> rusqlite::Result<()> {
+        let Some(path) = &self.log_path else { return Ok(()) };
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size < self.rotate_at || state.seq == 0 {
+            return Ok(());
+        }
+        let archived = log::archive(path, state.seq).map_err(io_error)?;
+        let name = archived.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut snapshot = log::snapshot_of(&self.conn, Some(format!("continues the log kept as {name}")))?;
+        snapshot.continues = Some(state.hash.clone());
+        state.offset = 0;
+        self.append_entry(state, Event::Snapshot(snapshot))
+    }
+
+    #[cfg(test)]
+    pub fn rotate_at(mut self, bytes: u64) -> Self {
+        self.rotate_at = bytes;
+        self
     }
 
     fn append_entry(&self, state: &mut log::State, event: Event) -> rusqlite::Result<()> {
@@ -543,7 +568,10 @@ impl History {
         let Some(path) = &self.log_path else { return Ok(0) };
         let mut applied = 0;
         for (entry, offset) in log::read_from(path, state.offset).map_err(io_error)? {
-            if entry.prev != state.hash || !entry.is_sound() {
+            // the first line of a rotated log follows the file that was set aside: its snapshot says so
+            let continues_archive = state.seq == 0
+                && matches!(&entry.event, Event::Snapshot(s) if s.continues.as_deref() == Some(entry.prev.as_str()));
+            if (entry.prev != state.hash && !continues_archive) || !entry.is_sound() {
                 // not the next line of this chain: leave it for `audit verify` to report
                 break;
             }

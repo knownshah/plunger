@@ -130,6 +130,14 @@ plunger audit rebuild                   # recreate the database from the log
 
 An agent cannot read or write it: there is no MCP tool for it. What it stops: an edit to the file made without going through Plunger shows up in `verify`. What it does not stop: a process running as you that rewrites the whole file and its hashes (the keyed version is planned, #201).
 
+## What comes back
+
+- `status`, `ok`, `elapsed_ms` and `ttfb_ms` (until the headers arrived), `size_bytes`.
+- A JSON body as `json`, or its outline when it is long; any other text as `body`, cut at `max_body_chars`.
+- A redirect: `final_url` and `redirects` (`[{"status": 301, "url": "..."}]`) when the request was redirected; absent otherwise.
+- A binary body is never returned: `binary: true`, `sha256` and `detected_type` let you check it. On the command line `--out FILE` writes the whole body to a file and the result carries `body_file`.
+- `headers` as `include_headers` says: `all` (the default), `none`, or `relevant` (location, link, retry-after, content type and disposition, etag, rate-limit headers, and a cookie's name without its value). With `select` the default is `none`; `header:Name` in `select` returns one.
+
 ## Variables in a JSON body
 
 A `{{variable}}` inside a JSON string is JSON-escaped for you: a description with a line break, a quote or a backslash arrives as exactly that text, so do not escape it yourself (a value you already escaped would arrive with a visible backslash). Outside a string the value is inserted as JSON, so a variable can be a number, `true`, or a whole array or object:
