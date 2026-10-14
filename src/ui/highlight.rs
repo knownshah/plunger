@@ -143,7 +143,10 @@ pub fn variables(text: &str, base: Color32, font: &FontId, variables: &[Variable
         let Some(len) = rest[start..].find("}}") else { break };
         let token = &rest[start..start + len + 2];
         append(&mut job, &rest[..start], font, base);
-        let color = if variable_is_defined(&token[2..token.len() - 2], variables) { palette().accent_text } else { palette().error };
+        // a default or an optional mark means the request is not refused for lack of a value
+        let placeholder = crate::domain::vars::parse_placeholder(&token[2..token.len() - 2]);
+        let fine = placeholder.default.is_some() || placeholder.optional || variable_is_defined(placeholder.name, variables);
+        let color = if fine { palette().accent_text } else { palette().error };
         append(&mut job, token, font, color);
         rest = &rest[start + len + 2..];
     }

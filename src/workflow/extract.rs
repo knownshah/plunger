@@ -93,16 +93,24 @@ enum Segment {
     Index(usize),
     /// `[*]`: every item of an array.
     Every,
-    /// `[?(@.name=='Done')]`: the items of an array whose field (a dotted path from `@`) equals the value.
-    Filter { field: Vec<String>, equals: Value },
+    /// `[?(@.name=='Done')]`: the items of an array whose field (a dotted path from `@`) equals the value,
+    /// or with `!=` does not.
+    Filter { field: Vec<String>, equals: Value, negate: bool },
 }
 
-/// `?(@.a.b == 'x')` (the inside of the brackets). Only equality with a string, number, `true`, `false`
-/// or `null` is understood.
+/// `?(@.a.b == 'x')` or `!=` (the inside of the brackets). Only comparison with a string, number, `true`,
+/// `false` or `null` is understood.
 fn parse_filter(inner: &str, path: &str) -> Result<Segment, String> {
     let bad = || format!("`[{inner}]` in `{path}`: a filter looks like [?(@.name=='Done')] (equality only)");
     let body = inner.strip_prefix("?(").and_then(|s| s.strip_suffix(')')).ok_or_else(bad)?.trim();
-    let (left, right) = body.split_once("==").ok_or_else(bad)?;
+    // the first operator wins, so a value such as 'a!=b' is not taken for one
+    let (at, negate) = match (body.find("!="), body.find("==")) {
+        (Some(n), Some(e)) if e < n => (e, false),
+        (Some(n), _) => (n, true),
+        (None, Some(e)) => (e, false),
+        (None, None) => return Err(bad()),
+    };
+    let (left, right) = (&body[..at], &body[at + 2..]);
     let field = left.trim().strip_prefix("@.").ok_or_else(bad)?;
     let field: Vec<String> = field.split('.').map(|f| f.trim().to_string()).collect();
     if field.iter().any(|f| f.is_empty()) {
@@ -120,7 +128,7 @@ fn parse_filter(inner: &str, path: &str) -> Result<Segment, String> {
         (None, "null") => Value::Null,
         (None, number) => serde_json::from_str::<Value>(number).ok().filter(Value::is_number).ok_or_else(bad)?,
     };
-    Ok(Segment::Filter { field, equals })
+    Ok(Segment::Filter { field, equals, negate })
 }
 
 fn parse_path(path: &str) -> Result<Vec<Segment>, String> {
@@ -214,9 +222,9 @@ pub fn json_path(value: &Value, path: &str) -> Result<Value, String> {
                     fanned = true;
                     next.extend(items.iter());
                 }
-                (Segment::Filter { field, equals }, Value::Array(items)) => {
+                (Segment::Filter { field, equals, negate }, Value::Array(items)) => {
                     fanned = true;
-                    next.extend(items.iter().filter(|item| field_of(item, field) == Some(equals)));
+                    next.extend(items.iter().filter(|item| (field_of(item, field) == Some(equals)) != *negate));
                 }
                 (Segment::Filter { .. }, _) if !fanned => return Err(format!("a filter is not inside an array (at `{path}`)")),
                 (Segment::Every, _) => return Err(format!("[*] is not inside an array (at `{path}`)")),
@@ -332,6 +340,7 @@ mod tests {
         assert_eq!(json_path(&v, "$.transitions[?(@.to.name=='Closed')].id").unwrap(), json!(["41"]));
         assert_eq!(json_path(&v, "$.transitions[?(@.id==51)].name").unwrap(), json!(["Won't fix [later]"]));
         assert_eq!(json_path(&v, "$.transitions[?(@.name=='nothing')].id").unwrap(), json!([]));
+        assert_eq!(json_path(&v, "$.transitions[?(@.name!='Done')].id").unwrap(), json!(["11", 51]));
         assert!(json_path(&v, "$.transitions[?(@.name>'a')].id").is_err());
         assert!(json_path(&v, "$.transitions[?(name=='a')].id").is_err());
         assert!(json_path(&v, "$.transitions[?(@.name=='a')").is_err(), "a [ without a ]");

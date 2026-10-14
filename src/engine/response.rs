@@ -374,7 +374,7 @@ fn collect_names(text: &str, names: &mut Vec<String>) {
     while let Some(start) = rest.find("{{") {
         let after = &rest[start + 2..];
         let Some(end) = after.find("}}") else { return };
-        let name = after[..end].trim();
+        let name = crate::domain::vars::parse_placeholder(&after[..end]).name;
         let is_env = name.strip_prefix("$env:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         let valid = is_env
             || (!name.is_empty()

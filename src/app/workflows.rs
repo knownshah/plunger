@@ -491,8 +491,14 @@ impl ApiTesterApp {
                         for e in &step.request.extract {
                             notes.push(format!("keeps {} from {}{}", e.name, e.from, if e.secret == Some(true) { " (secret)" } else { "" }));
                         }
-                        if let Some(want) = step.expect_status {
-                            notes.push(format!("expects {want}"));
+                        if let Some(want) = &step.expect_status {
+                            notes.push(format!("expects {}", want.describe()));
+                        }
+                        if let Some(condition) = &step.skip_if {
+                            notes.push(format!("skipped if {condition}"));
+                        }
+                        if let Some(condition) = &step.stop_if {
+                            notes.push(format!("stops the run if {condition}"));
                         }
                         if !notes.is_empty() {
                             ui.horizontal(|ui| {

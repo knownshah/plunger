@@ -209,6 +209,18 @@ pub fn send_request(params: &SendParams, source: Source) -> Result<AgentResponse
     Ok(shaped)
 }
 
+/// Whether a workflow condition holds: `expression` with the session's variables and `values` filled in
+/// (a variable with no value is empty, never an error), then `==`, `!=` or truthiness.
+pub fn evaluate_condition(expression: &str, values: &BTreeMap<String, String>) -> Result<bool, String> {
+    let session = Session::load();
+    let mut variables = session.state.variables.clone();
+    variables.extend(values.iter().map(|(name, value)| crate::domain::model::Variable { name: name.clone(), value: value.clone(), secret: false, remember: false }));
+    // later entries win, as they do for a request
+    variables.reverse();
+    let filled = crate::domain::vars::Resolver::new(&variables).apply(expression);
+    Ok(crate::workflow::condition_holds(&filled))
+}
+
 /// Checks `extract` and `select` before anything is sent.
 pub(crate) fn check_reading_instructions(params: &SendParams) -> Result<(), String> {
     for e in &params.extract {

@@ -127,14 +127,24 @@ A `{{variable}}` inside a JSON string is JSON-escaped for you: a description wit
 
 with `labels` set to `["backend", "urgent"]`. Only the JSON body is treated this way; a raw or form body, headers and the URL take the value as it is (the query string is percent-encoded).
 
+### Defaults and optional values
+
+An undefined `{{name}}` refuses the request, so a request never goes out with a literal placeholder. Two marks say a value may be missing (an empty value counts as missing):
+
+- `{{name|default}}` uses `default` when there is no value: `"priority": "{{priority|Medium}}"`, `/search?limit={{limit|20}}`. The default is the text as written after the `|`, escaped like any value.
+- `{{name?}}` is optional. In a JSON body the whole member (or array item) is left out when there is no value: `"assignee": {"name": "{{who?}}"}` becomes `"assignee": {}`, and `"labels": {{labels?}}` and `"epic": "{{epic?}}"` disappear. Elsewhere (the URL, a header, a raw body) it is empty. A body with nothing left out is sent exactly as written; when something is left out the body is re-written as compact JSON.
+
+One request can then create an issue with an optional assignee, labels and epic.
+
 A request you save with `save_request` keeps its `timeout_secs`, `follow_redirects`, `insecure_tls` and `select`, and uses them when it is sent by name (a value in the call wins). Fields a saved request cannot keep (`variables`, `use_saved_bearer`, `extract`, `max_body_chars`) are named in `not_saved` in the result.
 
 ## Workflows
 
 A workflow is a saved list of requests where a later one can use a value from an earlier response, for example log in, then call the API with the token. A step is a request (a saved one by name, or `method` / `url` / `headers` / `json` / `body` / `form`) plus:
 
-- `extract`: `[{"name": "token", "from": "json:$.access_token"}]` keeps a value as `{{token}}` for the steps after it. `from` is `json:$.a.b[0]`, `header:Name` or `status`. A name like `token` or `password` (or `"secret": true`) goes to the system credential store and is never shown, but it is used in the next request. The value is read from the response as the server sent it, before any secret is masked.
-- `expect_status`: the status the step must return. Without it any 2xx passes. A failing step stops the run.
+- `extract`: `[{"name": "token", "from": "json:$.access_token"}]` keeps a value as `{{token}}` for the steps after it. `from` is `json:$.a.b[0]`, `header:Name` or `status`. A name like `token` or `password` (or `"secret": true`) goes to the system credential store and is never shown, but it is used in the next request. The value is read from the response as the server sent it, before any secret is masked. `"scope": "run"` keeps the value for the later steps of this run only: nothing is stored, so nothing is left behind for the next run or another agent.
+- `expect_status`: the status the step must return, or a list of acceptable ones (`[200, 404]`). Without it any 2xx passes. A failing step stops the run.
+- `skip_if` and `stop_if`: a condition that is checked before the step is sent. `skip_if` leaves the step out (it counts as passed) and goes on; `stop_if` ends the run there, successfully. A condition is `{{a}} == b`, `{{a}} != b`, or one value that is true unless it is empty, `false`, `0` or `null`; a variable with no value is empty, not an error. `{{previous_status}}` is the status of the last step that was sent, so "look it up, create it only if it is missing" is `expect_status: [200, 404]` on the lookup and `skip_if: "{{previous_status}} == 200"` on the create.
 
 ```json
 [
@@ -147,7 +157,7 @@ A workflow is a saved list of requests where a later one can use a value from an
 ]
 ```
 
-From a terminal: `plunger workflow save shop @steps.json`, `plunger workflow run shop --var base=http://localhost:8080` (exit code 4 when a step fails), `plunger workflow list|show|delete`. Variables a workflow sets stay afterwards and show in the window under "Set by agents".
+From a terminal: `plunger workflow save shop @steps.json`, `plunger workflow run shop --var base=http://localhost:8080` (exit code 4 when a step fails), `plunger workflow list|show|delete`. Variables a workflow sets stay afterwards and show in the window under "Set by agents", unless a step used `"scope": "run"` or the run was made with `--cleanup` (`cleanup: true` over MCP), which removes the variables the run stored once it is done.
 
 ## Workflows in the window
 

@@ -40,16 +40,12 @@ impl<'a> Resolver<'a> {
                 return out;
             };
             let token_len = 2 + end + 2;
-            let name = after[..end].trim();
-            match self.lookup(name) {
-                Some(value) => out.push_str(&encode(&value)),
-                None => {
-                    if is_valid_name(name) || environment_name(name).is_some() {
-                        self.undefined.insert(name.to_string());
-                    }
-                    // Undefined or not a variable at all (e.g. `{{"a":1}}`): leave untouched.
-                    out.push_str(&rest[start..start + token_len]);
-                }
+            match self.resolve(&after[..end]) {
+                Resolved::Value(value) => out.push_str(&encode(&value)),
+                // `{{name?}}` with no value: nothing, outside a JSON body
+                Resolved::Omit => {}
+                // Undefined or not a variable at all (e.g. `{{"a":1}}`): leave untouched.
+                Resolved::Undefined => out.push_str(&rest[start..start + token_len]),
             }
             rest = &rest[start + token_len..];
         }
@@ -62,10 +58,14 @@ impl<'a> Resolver<'a> {
     /// break or a quote can't break the body. A value outside a string (`{"n": {{count}}}`,
     /// `{"labels": {{labels}}}`) is inserted as it is, so it can be a number, `true` or a whole
     /// JSON array or object.
+    ///
+    /// An optional placeholder with no value, `{{name?}}`, takes its whole member out of the
+    /// document (`"assignee": "{{who?}}"` or `"labels": {{labels?}}`), or its item out of an array.
     pub fn apply_json(&mut self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         let mut in_string = false;
+        let mut omitted = false;
         while let Some(start) = rest.find("{{") {
             let before = &rest[..start];
             in_string = advance_json_string_state(before, in_string);
@@ -73,24 +73,52 @@ impl<'a> Resolver<'a> {
             let after = &rest[start + 2..];
             let Some(end) = after.find("}}") else {
                 out.push_str(&rest[start..]);
-                return out;
+                return finish_json(out, omitted);
             };
             let token_len = 2 + end + 2;
-            let name = after[..end].trim();
-            match self.lookup(name) {
-                Some(value) if in_string => out.push_str(&json_escape(&value)),
-                Some(value) => out.push_str(&value),
-                None => {
-                    if is_valid_name(name) || environment_name(name).is_some() {
-                        self.undefined.insert(name.to_string());
+            match self.resolve(&after[..end]) {
+                Resolved::Value(value) if in_string => out.push_str(&json_escape(&value)),
+                Resolved::Value(value) => out.push_str(&value),
+                Resolved::Omit => {
+                    // the whole string, `"{{x?}}"`, or a value outside a string: the member goes
+                    let whole_string = in_string && opens_a_string(&out) && rest[start + token_len..].starts_with('"');
+                    if whole_string {
+                        out.push_str(OMIT_INSIDE_STRING);
+                        omitted = true;
+                    } else if !in_string {
+                        out.push_str(OMIT_AS_STRING);
+                        omitted = true;
                     }
-                    out.push_str(&rest[start..start + token_len]);
+                    // inside a longer string it is just empty
                 }
+                Resolved::Undefined => out.push_str(&rest[start..start + token_len]),
             }
             rest = &rest[start + token_len..];
         }
         out.push_str(rest);
-        out
+        finish_json(out, omitted)
+    }
+
+    /// What `{{inner}}` stands for: its value, nothing (an optional one with no value), or unknown
+    /// (which is remembered, so the send can be refused).
+    fn resolve(&mut self, inner: &str) -> Resolved {
+        let placeholder = parse_placeholder(inner);
+        let name = placeholder.name;
+        let found = self.lookup(name);
+        let usable = found.filter(|v| !v.is_empty() || (!placeholder.optional && placeholder.default.is_none()));
+        if let Some(value) = usable {
+            return Resolved::Value(value);
+        }
+        if let Some(default) = placeholder.default {
+            return Resolved::Value(default.to_string());
+        }
+        if placeholder.optional {
+            return Resolved::Omit;
+        }
+        if is_valid_name(name) || environment_name(name).is_some() {
+            self.undefined.insert(name.to_string());
+        }
+        Resolved::Undefined
     }
 
     fn lookup(&self, name: &str) -> Option<String> {
@@ -117,6 +145,72 @@ impl<'a> Resolver<'a> {
             names.join(", "),
             if names.len() == 1 { "it" } else { "them" },
         ))
+    }
+}
+
+enum Resolved {
+    Value(String),
+    Omit,
+    Undefined,
+}
+
+/// What is written between the braces: `name`, `name|default` (used when there is no value) or
+/// `name?` (optional: left out of a JSON body, empty elsewhere, when there is no value).
+#[derive(Debug, PartialEq)]
+pub struct Placeholder<'a> {
+    pub name: &'a str,
+    pub default: Option<&'a str>,
+    pub optional: bool,
+}
+
+pub fn parse_placeholder(inner: &str) -> Placeholder<'_> {
+    let (name, default) = match inner.split_once('|') {
+        Some((name, default)) => (name, Some(default.trim())),
+        None => (inner, None),
+    };
+    let name = name.trim();
+    match name.strip_suffix('?') {
+        Some(stripped) => Placeholder { name: stripped.trim_end(), default, optional: true },
+        None => Placeholder { name, default, optional: false },
+    }
+}
+
+/// A string no request would carry, standing for "take this member out" until the body is parsed.
+const OMIT_INSIDE_STRING: &str = "\\u0000plunger-omit";
+const OMIT_AS_STRING: &str = "\"\\u0000plunger-omit\"";
+const OMIT_VALUE: &str = "\u{0}plunger-omit";
+
+/// Whether the last character written is a quote that opens (or closes) a string, not an escaped one.
+fn opens_a_string(out: &str) -> bool {
+    let Some(before) = out.strip_suffix('"') else { return false };
+    (before.len() - before.trim_end_matches('\\').len()) % 2 == 0
+}
+
+/// Takes the members and items that stand for an omitted placeholder out of the document.
+fn finish_json(text: String, omitted: bool) -> String {
+    if !omitted {
+        return text;
+    }
+    fn prune(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|k, v| k != OMIT_VALUE && v.as_str() != Some(OMIT_VALUE));
+                map.values_mut().for_each(prune);
+            }
+            serde_json::Value::Array(items) => {
+                items.retain(|v| v.as_str() != Some(OMIT_VALUE));
+                items.iter_mut().for_each(prune);
+            }
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(mut value) => {
+            prune(&mut value);
+            serde_json::to_string(&value).unwrap_or(text)
+        }
+        // not JSON as written; say null rather than send the marker
+        Err(_) => text.replace(OMIT_AS_STRING, "null").replace(OMIT_INSIDE_STRING, ""),
     }
 }
 

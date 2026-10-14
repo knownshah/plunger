@@ -478,6 +478,78 @@ mod tests {
         assert_eq!(text_body(&build(&s, "")), Some("k=a\nb \"q\""));
     }
 
+    fn json_with(template: &str, vars: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+        let mut s = state();
+        s.method = "POST".into();
+        s.variables = vars.iter().map(|(n, v)| var(n, v)).collect();
+        s.body_mode = BodyMode::Json;
+        s.json_body = template.into();
+        let r = build_request(&s, "")?;
+        let text = text_body(&r).expect("a text body").to_string();
+        Ok(serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text:?}")))
+    }
+
+    #[test]
+    fn a_default_is_used_when_there_is_no_value() {
+        let body = r#"{"assignee": "{{who|unassigned}}", "n": {{n|3}}, "note": "Re: {{topic|none}}"}"#;
+        let p = json_with(body, &[]).unwrap();
+        assert_eq!((&p["assignee"], &p["n"], &p["note"]), (&serde_json::json!("unassigned"), &serde_json::json!(3), &serde_json::json!("Re: none")));
+        // a value wins; an empty value counts as no value
+        let p = json_with(body, &[("who", "ann"), ("n", "9"), ("topic", "")]).unwrap();
+        assert_eq!((&p["assignee"], &p["n"], &p["note"]), (&serde_json::json!("ann"), &serde_json::json!(9), &serde_json::json!("Re: none")));
+        // the default is escaped like a value, and may be empty
+        assert_eq!(json_with(r##"{"a": "{{x|say "hi"}}"}"##, &[]).unwrap()["a"], "say \"hi\"");
+        assert_eq!(json_with(r#"{"a": "{{x|}}"}"#, &[]).unwrap()["a"], "");
+        // a placeholder without one is still refused
+        assert!(json_with(r#"{"a": "{{x}}"}"#, &[]).unwrap_err().contains("{{x}}"));
+    }
+
+    #[test]
+    fn an_optional_placeholder_with_no_value_takes_its_member_out_of_the_body() {
+        let body = r#"{"fields": {"summary": "{{summary}}", "assignee": {"name": "{{who?}}"}, "epic": "{{epic?}}", "labels": {{labels?}}, "tags": ["a", "{{tag?}}", "b"]}}"#;
+        // nothing given: the optional members are gone, the rest is untouched
+        let p = json_with(body, &[("summary", "S")]).unwrap();
+        assert_eq!(p, serde_json::json!({"fields": {"summary": "S", "assignee": {}, "tags": ["a", "b"]}}));
+        // all given
+        let p = json_with(body, &[("summary", "S"), ("who", "ann"), ("epic", "E-1"), ("labels", r#"["x","y"]"#), ("tag", "t")]).unwrap();
+        assert_eq!(
+            p,
+            serde_json::json!({"fields": {"summary": "S", "assignee": {"name": "ann"}, "epic": "E-1", "labels": ["x", "y"], "tags": ["a", "t", "b"]}})
+        );
+        // an empty value is no value
+        let p = json_with(r#"{"a": 1, "b": "{{b?}}"}"#, &[("b", "")]).unwrap();
+        assert_eq!(p, serde_json::json!({"a": 1}));
+        // inside a longer string it is just empty
+        assert_eq!(json_with(r#"{"a": "x{{b?}}y"}"#, &[]).unwrap()["a"], "xy");
+        // a body with nothing omitted is sent exactly as written
+        let mut s = state();
+        s.variables = vec![var("b", "1")];
+        s.body_mode = BodyMode::Json;
+        s.json_body = "{\n  \"b\": \"{{b?}}\"\n}".into();
+        assert_eq!(text_body(&build(&s, "")), Some("{\n  \"b\": \"1\"\n}"));
+    }
+
+    #[test]
+    fn defaults_and_optional_marks_work_outside_a_json_body_too() {
+        let mut s = state();
+        s.variables = vec![var("have", "yes")];
+        s.url = "http://h/{{missing|dflt}}?a={{have?}}&b={{nope?}}&c={{c|x y}}".into();
+        s.headers_text = "X-Opt: {{nope?}}\nX-Def: {{nope|fallback}}".into();
+        let r = build(&s, "");
+        assert_eq!(r.url, "http://h/dflt?a=yes&b=&c=x%20y");
+        assert!(r.headers.contains(&("X-Def".into(), "fallback".into())));
+        assert!(r.headers.iter().any(|(k, v)| k == "X-Opt" && v.is_empty()));
+    }
+
+    #[test]
+    fn the_names_a_request_needs_leave_out_defaults_and_marks() {
+        let mut s = state();
+        s.url = "http://h/{{a|d}}/{{b?}}/{{c}}".into();
+        s.body_mode = BodyMode::Json;
+        s.json_body = r#"{"x": "{{a}}", "y": {{d?}}}"#.into();
+        assert_eq!(crate::engine::variables_used(&s), vec!["a", "b", "c", "d"]);
+    }
+
     #[test]
     fn undefined_variables_block_the_send_and_disabled_rows_are_ignored() {
         let mut s = state();

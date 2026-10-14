@@ -35,7 +35,7 @@ TOOLS
 - import_curl: parse a curl command into a request, and with `save_as` keep it in the user's Saved list.
 - export_curl: a saved request or a history entry as a curl command.
 - get_history: recent requests, who sent them (gui, cli, mcp), status and time. Narrow it with `search`, `status` (401, 4xx, 5xx, ok, fail, error), `min_ms` (the slow ones), `source` and `saved_request` (how one saved request has been doing). get_history_entry: one entry in full by id, with the request as sent.
-- save_workflow / run_workflow / list_workflows / delete_workflow: a workflow is an ordered list of steps (each is like send_request, plus `extract` and `expect_status`). `extract` takes a value from the response (`json:$.data.token`, `header:Name` or `status`) and keeps it as a variable for the steps after it, so a login token reaches the next request without you ever seeing it. A step that fails (not 2xx, or not `expect_status`) stops the run. run_workflow takes `variables` that apply to every step.
+- save_workflow / run_workflow / list_workflows / delete_workflow: a workflow is an ordered list of steps (each is like send_request, plus `extract` and `expect_status`). `extract` takes a value from the response (`json:$.data.token`, `header:Name` or `status`) and keeps it as a variable for the steps after it, so a login token reaches the next request without you ever seeing it. A step that fails (not 2xx, or not `expect_status`, which may be a list such as [200, 404]) stops the run. `skip_if` skips a step and `stop_if` ends the run successfully when a condition holds (`{{a}} == b`, `{{a}} != b`, or a value that is true unless empty, false, 0 or null; `{{previous_status}}` is the status before); `extract` with `\"scope\": \"run\"` keeps a value for the later steps of that run only. run_workflow takes `variables` that apply to every step, and `cleanup: true` removes the variables the run stored.
 
 HOW IT BEHAVES
 - {{variables}} work in the URL, headers and body. Secret values are filled in for you and never shown; if a server echoes one back it appears as [redacted:name]. A request with an undefined {{variable}} is refused, not sent.
@@ -114,6 +114,10 @@ pub struct RunWorkflowParams {
     /// {{variable}} values for every step of this run.
     #[serde(default)]
     pub variables: Option<std::collections::BTreeMap<String, String>>,
+    /// Remove the variables this run stored once it is done (the later steps have used them by then), so
+    /// runs do not leave values behind. Values extracted with `scope: "run"` are never stored at all.
+    #[serde(default)]
+    pub cleanup: Option<bool>,
 }
 
 /// A tool's structured result is a JSON object, so lists are wrapped. MCP 2025-06-18 and 2025-11-25
@@ -295,7 +299,7 @@ impl PlungerMcp {
     /// variables it set, plus the last response in full.
     #[tool(name = "run_workflow", annotations(title = "Run a workflow", open_world_hint = true))]
     async fn run_workflow(&self, Parameters(p): Parameters<RunWorkflowParams>) -> Result<Json<WorkflowResult>, String> {
-        blocking(move || workflow::run(&p.name, &p.variables.unwrap_or_default(), Source::Mcp)).await.map(Json)
+        blocking(move || workflow::run(&p.name, &p.variables.unwrap_or_default(), Source::Mcp, p.cleanup.unwrap_or(false))).await.map(Json)
     }
 
     /// List the saved workflows with their steps.

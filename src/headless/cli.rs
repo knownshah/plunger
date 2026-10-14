@@ -158,8 +158,9 @@ plunger send <name> [options]       send a saved request; any option overrides t
         "workflow" | "workflows" => "\
 plunger workflow                        list workflows
 plunger workflow show <name>            a workflow's steps
-plunger workflow run <name> [--var name=value ...]
-                                        send the steps in order; stops at the first failure
+plunger workflow run <name> [--var name=value ...] [--cleanup]
+                                        send the steps in order; stops at the first failure.
+                                        --cleanup removes the variables the run stored when it is done
 plunger workflow save <name> <steps> [--overwrite]
                                         <steps> is JSON, or @file.json, or @- for standard input
 plunger workflow delete <name>
@@ -168,7 +169,11 @@ A workflow is a JSON array of steps. A step is a request (saved_request, or meth
 json / body / form) plus:
   extract        [{\"name\": \"token\", \"from\": \"json:$.access_token\"}]  keep a value as {{name}} for the next steps
                  `from` is json:$.path, header:Name or status; a name like token or password stays secret
-  expect_status  the status the step must return (default: any 2xx)
+  expect_status  the status the step must return, or a list [200, 404] (default: any 2xx)
+  skip_if        a condition ({{a}} == b, {{a}} != b, or a value that is true unless empty, false, 0, null):
+                 the step is not sent and counts as passed. {{previous_status}} is the step before's status
+  stop_if        the same condition: the run ends here, successfully
+  extract scope  \"scope\": \"run\" keeps the value for this run's later steps only, never stored
 
 Example: [{\"method\":\"POST\",\"url\":\"{{base}}/login\",\"json\":{\"user\":\"{{username}}\",\"password\":\"{{password}}\"},
           \"extract\":[{\"name\":\"token\",\"from\":\"json:$.token\"}]},
@@ -418,15 +423,18 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                 Some("run") => {
                     let name = args.value("workflow run")?;
                     let mut variables = BTreeMap::new();
+                    let mut cleanup = false;
                     while let Some(arg) = args.next() {
                         if arg == "--var" {
                             let (k, v) = args.pair(&arg)?;
                             variables.insert(k, v);
+                        } else if arg == "--cleanup" {
+                            cleanup = true;
                         } else {
                             return Err(usage_error(format!("Unexpected argument `{arg}`")));
                         }
                     }
-                    let result = workflow::run(&name, &variables, Source::Cli).map_err(error)?;
+                    let result = workflow::run(&name, &variables, Source::Cli, cleanup).map_err(error)?;
                     print_json(&result);
                     return Ok(if result.ok { EXIT_OK } else { EXIT_HTTP_ERROR });
                 }
@@ -572,7 +580,7 @@ impl SendOptions {
             }
             "--extract" => {
                 let (name, from) = args.pair(arg)?;
-                p.extract.push(crate::workflow::Extract { name, from, secret: None });
+                p.extract.push(crate::workflow::Extract { name, from, secret: None, scope: None });
             }
             "--select" => p.select.get_or_insert_with(Vec::new).push(args.value(arg)?),
             "--use-saved-bearer" => p.use_saved_bearer = Some(true),
