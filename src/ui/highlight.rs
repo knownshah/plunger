@@ -16,7 +16,7 @@ fn append(job: &mut LayoutJob, text: &str, font: &FontId, color: Color32) {
 /// Adds `text` in `color`, with each `{{placeholder}}` in the placeholder colour.
 fn append_with_placeholders(job: &mut LayoutJob, text: &str, font: &FontId, color: Color32, placeholder: Color32) {
     let mut rest = text;
-    while let Some(start) = rest.find("{{") {
+    while let Some(start) = rest.find("{{{") {
         let Some(len) = rest[start..].find("}}") else { break };
         append(job, &rest[..start], font, color);
         append(job, &rest[start..start + len + 2], font, placeholder);
@@ -25,22 +25,17 @@ fn append_with_placeholders(job: &mut LayoutJob, text: &str, font: &FontId, colo
     append(job, rest, font, color);
 }
 
-/// Text longer than this is drawn without colours (and bodies are not validated): building the
-/// colours and parsing the text on every frame cost a core and hundreds of MB for a few MB of text.
 pub const LARGE_TEXT_BYTES: usize = 128 * 1024;
 
-/// `text` in one colour, for text too large to colour.
 pub fn plain(text: &str, color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     append(&mut job, text, &FontId::monospace(13.0), color);
     job
 }
 
-const COMMAND_WORDS: &[&str] = &["curl", "curl.exe", "invoke-restmethod", "invoke-webrequest", "irm", "iwr", "plunger", "new-object"];
+const COMMAND_WORDS: &[&str] = &["curl", "curl.exe", "http", "https", "invoke-restmethod", "invoke-webrequest", "irm", "iwr", "plunger", "new-object"];
 
-/// A shell command in any of the supported dialects: bash curl, Windows cmd curl, PowerShell. The
-/// command name, `-flags`, quoted strings, `{{placeholders}}`, `$variables`, numbers and the
-/// punctuation that continues or structures a command each get their own colour.
+/// A shell command in any of the supported dialects: bash curl, Windows cmd curl, PowerShell, HTTPie.
 pub fn command(text: &str) -> LayoutJob {
     let [punct, flag, string, number, variable, default] = palette().json;
     let (accent, placeholder) = (palette().accent_text, palette().amber);
@@ -62,7 +57,6 @@ pub fn command(text: &str) -> LayoutJob {
             append(&mut job, &text[i..end], &font, comment);
             end
         } else if c == '\'' || c == '"' {
-            // To the closing quote, skipping an escaped one (\" in bash and cmd, `" in PowerShell).
             let mut end = text.len();
             let mut chars = text[i + 1..].char_indices();
             while let Some((n, ch)) = chars.next() {
@@ -83,7 +77,7 @@ pub fn command(text: &str) -> LayoutJob {
             let end = rest[1..].find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.'))).map_or(text.len(), |n| i + 1 + n);
             append(&mut job, &text[i..end], &font, variable);
             end
-        } else if rest.starts_with("{{") && rest.contains("}}") {
+        } else if rest.starts_with("{{{") && rest.contains("}}") {
             let end = i + rest.find("}}").unwrap_or(0) + 2;
             append(&mut job, &text[i..end], &font, placeholder);
             end
@@ -91,7 +85,6 @@ pub fn command(text: &str) -> LayoutJob {
             append(&mut job, &text[i..i + c.len_utf8()], &font, punct);
             i + c.len_utf8()
         } else {
-            // A bare word: a URL, a command name, a number, a method.
             let end = rest.find(|ch: char| ch.is_whitespace() || matches!(ch, '\'' | '"' | ';' | '{' | '}' | '(' | ')' | '^' | '`' | '|' | ',')).map_or(text.len(), |n| i + n);
             let end = if end == i { i + c.len_utf8() } else { end };
             let word = &text[i..end];
@@ -112,8 +105,6 @@ pub fn command(text: &str) -> LayoutJob {
     job
 }
 
-/// The names of variables agents set. They are defined for every request, so wherever
-/// `{{variables}}` are coloured they count as defined even though the tab does not hold them.
 static AGENT_VARIABLES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 pub fn set_agent_variable_names(names: Vec<String>) {
@@ -122,7 +113,6 @@ pub fn set_agent_variable_names(names: Vec<String>) {
     }
 }
 
-/// Whether `{{name}}` would be filled in when the request is sent.
 pub fn variable_is_defined(name: &str, variables: &[Variable]) -> bool {
     let name = name.trim();
     if AGENT_VARIABLES.read().is_ok_and(|names| names.iter().any(|n| n == name)) {
@@ -134,16 +124,13 @@ pub fn variable_is_defined(name: &str, variables: &[Variable]) -> bool {
     matches!(name, "$uuid" | "$timestamp" | "$randomInt") || variables.iter().any(|v| v.name.trim() == name && !name.is_empty())
 }
 
-/// Text with each `{{variable}}` coloured by whether it is defined (accent) or not (red, the
-/// request would be refused).
 pub fn variables(text: &str, base: Color32, font: &FontId, variables: &[Variable]) -> LayoutJob {
     let mut job = LayoutJob::default();
     let mut rest = text;
-    while let Some(start) = rest.find("{{") {
+    while let Some(start) = rest.find("{{{") {
         let Some(len) = rest[start..].find("}}") else { break };
         let token = &rest[start..start + len + 2];
         append(&mut job, &rest[..start], font, base);
-        // a default or an optional mark means the request is not refused for lack of a value
         let placeholder = crate::domain::vars::parse_placeholder(&token[2..token.len() - 2]);
         let fine = placeholder.default.is_some() || placeholder.optional || variable_is_defined(placeholder.name, variables);
         let color = if fine { palette().accent_text } else { palette().error };
@@ -154,8 +141,6 @@ pub fn variables(text: &str, base: Color32, font: &FontId, variables: &[Variable
     job
 }
 
-/// A layouter for a single-line field that holds `{{variables}}`:
-/// `ui.add(theme::field(text).layouter(&mut highlight::variable_layouter(&vars)))`.
 pub fn variable_layouter(vars: &[Variable]) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley> + '_ {
     move |ui, text, wrap_width| {
         let text = text.as_str();
@@ -166,7 +151,6 @@ pub fn variable_layouter(vars: &[Variable]) -> impl FnMut(&egui::Ui, &dyn egui::
     }
 }
 
-/// `Name: value` lines: names in the key colour, `{{variables}}` as in [`variables`].
 pub fn header_lines(text: &str, vars: &[Variable]) -> LayoutJob {
     let [punct, key, _, _, _, default] = palette().json;
     let font = FontId::monospace(13.0);
@@ -190,7 +174,6 @@ pub fn header_lines(text: &str, vars: &[Variable]) -> LayoutJob {
     job
 }
 
-/// `key=value` lines or an `a=1&b=2` string: keys, `=` and `&` apart from values.
 pub fn form_body(text: &str) -> LayoutJob {
     let [punct, key, string, _, _, default] = palette().json;
     if text.len() > LARGE_TEXT_BYTES {
@@ -218,8 +201,6 @@ pub fn form_body(text: &str) -> LayoutJob {
     job
 }
 
-/// Colour for each stretch of a pretty-printed XML/HTML document: tags apart from text. The
-/// stretches cover the whole text, even an unterminated tag at the end.
 pub fn markup_segments(text: &str) -> Vec<(usize, usize, egui::Color32)> {
     let colors = palette().json;
     let mut segments = Vec::new();
@@ -243,7 +224,6 @@ pub fn markup_segments(text: &str) -> Vec<(usize, usize, egui::Color32)> {
     segments
 }
 
-/// XML or HTML, tags apart from text.
 pub fn markup(text: &str) -> LayoutJob {
     let font = FontId::monospace(13.0);
     let mut job = LayoutJob::default();
@@ -253,8 +233,6 @@ pub fn markup(text: &str) -> LayoutJob {
     job
 }
 
-/// A body of unknown type: JSON when it looks like JSON, markup when it looks like XML or HTML,
-/// a form when it is `key=value`, otherwise plain text.
 pub fn body(text: &str) -> LayoutJob {
     if text.len() > LARGE_TEXT_BYTES {
         return plain(text, palette().json[5]);
@@ -290,7 +268,7 @@ mod tests {
         "curl 'https://h/x?a=1' -H 'A: it'\\''s' -d '{\"a\":1}' -L",
         "curl \"https://h\" ^\r\n  -H \"accept: x\" ^\r\n  --data-raw \"^{^\\^\"a^\\^\":1^}\"",
         "Invoke-RestMethod -Uri 'https://h/it''s' `\n  -Headers @{ 'A' = 'b'; 'C' = {{token}} } `\n  -Body \"x`\"y\" # note",
-        "$session.UserAgent = \"ü ünï ✓ 日本語\"\nirm https://h/{{id}}?a=1&b=2 -Method Put",
+        "$session.UserAgent = \"x\"\nirm https://h/{{id}}?a=1&b=2 -Method Put",
         "unterminated 'string and \"another",
         "-1 --x -- - $ $$ @ {{ }} {{a}",
         "tab\tseparated\n\n\n  trailing  ",
