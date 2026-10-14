@@ -112,7 +112,7 @@ mod tests {
     use crate::domain::model::{BodyMode, FieldKind, FormField, PersistedState};
 
     fn httpie(state: &PersistedState) -> String {
-        export(state, Dialect::Httpie)
+        export(state, Dialect::HttpieBash)
     }
 
     #[test]

@@ -18,14 +18,13 @@ impl History {
     /// Creates or updates a variable set by an agent. A secret's value must not be passed here
     /// (it goes to the credential store); only the fact that it exists is recorded.
     pub fn set_agent_variable(&self, name: &str, value: &str, secret: bool, source: Source) -> rusqlite::Result<()> {
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-        self.conn.execute(
-            "INSERT INTO agent_variables (name, value, secret, source, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name) DO UPDATE SET value = ?2, secret = ?3, source = ?4, updated_at = ?5",
-            params![name, value, secret, source.as_str(), now],
-        )?;
+        self.commit(Event::VariableSet {
+            name: name.to_string(),
+            value: value.to_string(),
+            secret,
+            source: source.as_str().to_string(),
+            updated_at: now(),
+        })?;
         Ok(())
     }
 
@@ -42,13 +41,19 @@ impl History {
 
     /// Removes one agent variable; false when there was none by that name.
     pub fn delete_agent_variable(&self, name: &str) -> rusqlite::Result<bool> {
-        Ok(self.conn.execute("DELETE FROM agent_variables WHERE name = ?1", params![name])? > 0)
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_variables WHERE name = ?1)", params![name], |r| r.get(0))?;
+        if !exists {
+            return Ok(false);
+        }
+        Ok(self.commit(Event::VariableDeleted { name: name.to_string() })?.changed > 0)
     }
 
     /// Removes every agent variable and returns their names (so the caller can forget secrets).
     pub fn clear_agent_variables(&self) -> rusqlite::Result<Vec<String>> {
         let names: Vec<String> = self.list_agent_variables()?.into_iter().map(|v| v.name).collect();
-        self.conn.execute("DELETE FROM agent_variables", [])?;
+        if !names.is_empty() {
+            self.commit(Event::VariablesCleared)?;
+        }
         Ok(names)
     }
 }

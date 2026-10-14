@@ -12,6 +12,8 @@ Every request needs "Authorization: Bearer tok_tracker".
   POST /issue/<key>/transitions  {"transition": {"id"}} -> 204 with no body
   GET  /search?jql=              echoes the jql it received, decoded
   GET  /boom                     500 with an HTML error page
+  GET  /old                      301 to /search?jql=moved
+  GET  /blob                     a small PNG (binary)
 """
 import json
 import re
@@ -47,6 +49,10 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         if path == "/boom":
             return self.send(500, raw=b"<html><body>Internal Server Error</body></html>", ctype="text/html")
+        if path == "/old":
+            return self.send(301, raw=b"", extra={"Location": "/search?jql=moved"})
+        if path == "/blob":
+            return self.send(200, raw=b"\x89PNG\r\n\x1a\n" + bytes(64), ctype="image/png")
         if path == "/search":
             jql = parse_qs(url.query).get("jql", [""])[0]
             return self.send(200, {"jql": jql, "total": 0})

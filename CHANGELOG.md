@@ -4,13 +4,29 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+### Fixed
+- HTTPie export preserves encoded form and raw body bytes, escapes literal request items, and ignores stdin (#137).
+
+## [0.7.0] - 2026-10-14
+
+Agents get answers they can use and cannot fail on quietly, requests can be organised in groups, and every change is written to a log the database is derived from.
+
 ### Changed
+- A workflow's steps are drawn as a flow: a card per step on a rail of connected dots, the dots coloured by the last or running run (a diamond is a step that can be skipped, a square one that can end the run), the values a step hands to later ones written on the connector, and the values the workflow needs from outside listed on top.
 - The Variables window explains itself with a help icon instead of a paragraph.
 - Variables are no longer a tab in every request, because they are shared by all requests, the command line and agents. **Tools > Variables** opens them in a window, and each request shows only the ones it uses under the URL (`Uses base = https://..., token = [secret]`). A request opened from the history shows the values it was sent with (non-secret ones; a secret is never kept) (#191).
 - The Auth tab is gone: Authorization is a header (`Authorization: Bearer {{token}}`). A Bearer token saved in the old tab becomes the secret variable `bearer` and is no longer added to every request behind your back. Ctrl+1 to Ctrl+4 now open Params, Headers, Body and Options (#192).
 
 ### Added
-- Export requests as HTTPie `http` commands, including form bodies, multipart files and TLS/redirect options, with `{{variables}}` kept as placeholders (#137).
+- A response says how fast it started (`ttfb_ms`) and where a redirect went: `final_url` and `redirects` (each hop's status and destination), absent when there were none (#94).
+- A binary response gives its `sha256` and a sniffed `detected_type` (`png`, `pdf`, `zip`, ...), so an agent can check a download without receiving the bytes (#99).
+- `include_headers` (`all`, `none` or `relevant`) on `send_request` and `--include-headers` on `plunger send`; the relevant ones are location, link, retry-after, content type and disposition, etag, rate-limit headers and the names of cookies (#104).
+- `plunger send --out FILE` writes the whole body to a file (raw bytes for a binary one) and prints the result with `body_file` (#139).
+- Export a request as Python (`requests`) and as HTTPie, from File > Copy as and File > Export request (#136, #137).
+- The audit log is moved aside as `audit.<seq>.log` when it passes 20 MB, and the new file starts with a snapshot that names the hash it continues, so `plunger audit verify` still passes on each file.
+- A tab without a name is titled by the last two path segments (`users/42`, not `42`) (#127), and a tab restored after a restart still says how its history request went (#164).
+- An audit log: every change to the history, saved requests, workflows and agent variables is first written as a line of `audit.log` (who, when, what; no secrets, no response bodies), each line hash-chained to the one before, and applied to the database from it. `plunger audit verify` finds an edited, removed or reordered line (exit 4), `audit show` lists the changes, `audit head` prints the newest hash, and `audit rebuild` recreates the database from the log. An existing database starts its log with a snapshot (#199, #200).
+- Groups for saved requests and workflows, like Postman's folders: `Jira`, or `Jira/Issues` for one level under it. The sidebar shows a collapsible header per group, and a row's right-click menu has **Move to group** (existing groups, no group, or a new name). Over MCP, `save_request` and `save_workflow` take `group`, `list_saved_requests` and `list_workflows` take a `group` filter (a group includes what is under it), and a new `set_group` tool moves one without re-sending it. On the command line: `--group` on `save` and `workflow save`, `saved --group G`, `workflow list --group G`, `saved group <name> <group>` and `workflow group <name> <group>` (#194).
 - Placeholders can have a default, `{{priority|Medium}}`, and can be optional, `{{epic?}}`: with no value, an optional one is left out of a JSON body (the member or array item goes) and is empty elsewhere. One request can create an issue with an optional assignee, labels and epic (#184).
 - Workflow steps can accept several statuses (`"expect_status": [200, 404]`) and can be conditional: `skip_if` leaves a step out and `stop_if` ends the run successfully, with `{{a}} == b`, `{{a}} != b` or a truthy value, and `{{previous_status}}` for the status before (#188).
 - A workflow `extract` can be `"scope": "run"`, kept for that run only, and `run_workflow` takes `cleanup: true` (`--cleanup` on the command line) to remove the variables a run stored, so values from old runs do not pile up (#189).
@@ -253,7 +269,8 @@ Workflows get a window of their own, the toolkit is current (egui 0.36), and the
 
 First public release: send requests with params, headers, JSON, form-urlencoded, raw and multipart bodies; `{{variables}}`; secrets kept in Windows Credential Manager on request; curl and HAR import; local history; TLS-skip for local servers.
 
-[Unreleased]: https://github.com/metamug/plunger/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/metamug/plunger/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/metamug/plunger/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/metamug/plunger/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/metamug/plunger/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/metamug/plunger/compare/v0.5.1...v0.5.2

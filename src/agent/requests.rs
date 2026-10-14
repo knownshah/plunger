@@ -32,6 +32,9 @@ pub struct ImportedRequest {
     /// Fields of the call that a saved request does not keep (only said when there are some).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_saved: Vec<String>,
+    /// The group a saved request is filed under (`Jira`, `Jira/Issues`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// A request in the shape an agent reads: what it sends, and which `{{variables}}` it needs.
@@ -60,6 +63,7 @@ pub(super) fn imported_from_state(state: &PersistedState, saved_id: Option<i64>)
         saved_id,
         options: None,
         not_saved: Vec::new(),
+        group: None,
     }
 }
 
@@ -85,6 +89,9 @@ fn not_saved(params: &SendParams) -> Vec<String> {
     if !params.extract.is_empty() {
         out.push("extract: keep values from a response with extract on the send, or in a workflow step".to_string());
     }
+    if params.include_headers.is_some() {
+        out.push("include_headers: give it when sending".to_string());
+    }
     if params.max_body_chars.is_some() {
         out.push("max_body_chars: give it when sending".to_string());
     }
@@ -107,10 +114,10 @@ pub fn import_curl(curl: &str, save_as: Option<&str>, source: Source) -> Result<
 
 /// Saves the request described by `params` (nothing is sent) under `name`, keeping its
 /// `{{placeholders}}`. An existing name is refused unless `overwrite` is set, which replaces it.
-pub fn save_request(name: &str, overwrite: bool, params: &SendParams, source: Source) -> Result<ImportedRequest, String> {
+pub fn save_request(name: &str, overwrite: bool, params: &SendParams, group: Option<&str>, source: Source) -> Result<ImportedRequest, String> {
     let session = Session::load();
     let history = open_history()?;
-    save_request_with(&history, &session, name, overwrite, params, source)
+    save_request_with(&history, &session, name, overwrite, params, group, source)
 }
 
 pub(super) fn save_request_with(
@@ -119,15 +126,22 @@ pub(super) fn save_request_with(
     name: &str,
     overwrite: bool,
     params: &SendParams,
+    group: Option<&str>,
     source: Source,
 ) -> Result<ImportedRequest, String> {
+    // refused before anything is written; None leaves a replaced request in its group, "" takes it out
+    let group = group.map(crate::store::history::normalize_group).transpose()?;
     // a `select` that could never work is refused now, not discovered on the first send
     super::check_reading_instructions(params)?;
     let state = params.to_state(session, history)?;
     let id = save_request_in(history, name, overwrite, &state, source)?;
     let options = options_of(params);
     history.set_saved_options(id, &options).map_err(|e| format!("Couldn't save the request's options: {e}"))?;
+    if let Some(group) = &group {
+        history.set_group(id, group.as_deref()).map_err(|e| format!("Couldn't file the request in its group: {e}"))?;
+    }
     let mut shown = imported_from_state(&state, Some(id));
+    shown.group = engine::find_saved(history, name.trim()).ok().and_then(|e| e.group);
     shown.options = Some(options).filter(|o| !o.is_empty());
     shown.not_saved = not_saved(params);
     Ok(shown)
@@ -158,6 +172,7 @@ pub(super) fn show_saved_request_in(history: &History, name: &str) -> Result<Imp
     let entry = engine::find_saved(history, name)?;
     let mut shown = imported_from_state(&entry.to_persisted_state(), Some(entry.id));
     shown.options = Some(entry.options.clone()).filter(|o| !o.is_empty());
+    shown.group = entry.group.clone();
     Ok(shown)
 }
 
@@ -173,9 +188,48 @@ pub(super) fn delete_saved_in(history: &History, name: &str) -> Result<ImportedR
     Ok(imported_from_state(&entry.to_persisted_state(), Some(entry.id)))
 }
 
-pub fn list_saved_requests() -> Result<Vec<StoredRequestInfo>, String> {
+/// The saved requests, optionally only those in `group` (or under it).
+pub fn list_saved_requests(group: Option<&str>) -> Result<Vec<StoredRequestInfo>, String> {
     let saved = open_history()?.list_saved().map_err(|e| e.to_string())?;
-    Ok(saved.iter().map(StoredRequestInfo::from).collect())
+    Ok(saved
+        .iter()
+        .filter(|e| group.is_none_or(|g| crate::store::history::group_matches(e.group.as_deref(), g)))
+        .map(StoredRequestInfo::from)
+        .collect())
+}
+
+/// What `set_group` changed.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
+pub struct GroupChange {
+    /// `request` or `workflow`.
+    pub kind: String,
+    pub name: String,
+    /// The group it is in now; absent when it was taken out of its group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// Files a saved request or a workflow under `group` (an empty group takes it out of its group). The
+/// request or workflow itself is not touched.
+pub fn set_group(kind: &str, name: &str, group: &str) -> Result<GroupChange, String> {
+    let group = crate::store::history::normalize_group(group)?;
+    let history = open_history()?;
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "request" | "saved_request" => {
+            let entry = engine::find_saved(&history, name)?;
+            history.set_group(entry.id, group.as_deref()).map_err(|e| e.to_string())?;
+            Ok(GroupChange { kind: "request".into(), name: entry.name.unwrap_or_default(), group })
+        }
+        "workflow" => {
+            let wanted = name.trim();
+            if history.get_workflow(wanted).map_err(|e| e.to_string())?.is_none() {
+                return Err(format!("No workflow named '{wanted}'. See list_workflows."));
+            }
+            history.set_workflow_group(wanted, group.as_deref()).map_err(|e| e.to_string())?;
+            Ok(GroupChange { kind: "workflow".into(), name: wanted.to_string(), group })
+        }
+        other => Err(format!("`kind` is `request` or `workflow`, not `{other}`.")),
+    }
 }
 
 pub fn get_history(limit: Option<i64>, search: Option<&str>) -> Result<Vec<HistoryItem>, String> {

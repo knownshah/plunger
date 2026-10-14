@@ -2,8 +2,7 @@
 
 use super::*;
 
-/// How many runs of each workflow are kept.
-pub const WORKFLOW_RUNS_KEPT: i64 = 20;
+pub use crate::store::log::WORKFLOW_RUNS_KEPT;
 
 /// A workflow run to record.
 pub struct NewWorkflowRun<'a> {
@@ -44,30 +43,22 @@ fn workflow_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRu
 impl History {
     /// Creates or replaces a workflow; `steps` is its JSON.
     pub fn save_workflow(&self, name: &str, steps: &str) -> rusqlite::Result<()> {
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-        self.conn.execute(
-            "INSERT INTO workflows (name, steps, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET steps = ?2, updated_at = ?3",
-            params![name, steps, now],
-        )?;
+        self.commit(Event::WorkflowSaved { name: name.to_string(), steps: steps.to_string(), updated_at: now() })?;
         Ok(())
     }
 
     /// Records one run of a workflow, keeping the newest `WORKFLOW_RUNS_KEPT` of each workflow.
     pub fn record_workflow_run(&self, run: &NewWorkflowRun) -> rusqlite::Result<i64> {
-        self.conn.execute(
-            "INSERT INTO workflow_runs (workflow, started_at, source, ok, cancelled, steps) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run.workflow, run.started_at, run.source.as_str(), run.ok, run.cancelled, run.steps],
-        )?;
-        let id = self.conn.last_insert_rowid();
-        self.conn.execute(
-            "DELETE FROM workflow_runs WHERE workflow = ?1 AND id NOT IN
-               (SELECT id FROM workflow_runs WHERE workflow = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![run.workflow, WORKFLOW_RUNS_KEPT],
-        )?;
-        Ok(id)
+        let done = self.commit(Event::WorkflowRunRecorded {
+            id: 0, // handed out by `commit`
+            workflow: run.workflow.to_string(),
+            started_at: run.started_at.to_string(),
+            source: run.source.as_str().to_string(),
+            ok: run.ok,
+            cancelled: run.cancelled,
+            steps: run.steps.to_string(),
+        })?;
+        Ok(done.id)
     }
 
     /// The runs of one workflow, newest first.
@@ -103,9 +94,32 @@ impl History {
         rows.collect()
     }
 
+    /// Files a workflow under `group` (None takes it out of its group); false when there is no such workflow.
+    pub fn set_workflow_group(&self, name: &str, group: Option<&str>) -> rusqlite::Result<bool> {
+        if self.get_workflow(name)?.is_none() {
+            return Ok(false);
+        }
+        Ok(self.commit(Event::WorkflowGrouped { name: name.to_string(), group: group.map(str::to_string) })?.changed > 0)
+    }
+
+    /// The group of each workflow that has one, by name.
+    pub fn workflow_groups(&self) -> rusqlite::Result<std::collections::BTreeMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT name, group_name FROM workflows WHERE group_name IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
     /// Removes a workflow and its recorded runs; false when there was none by that name.
     pub fn delete_workflow(&self, name: &str) -> rusqlite::Result<bool> {
-        self.conn.execute("DELETE FROM workflow_runs WHERE workflow = ?1", params![name])?;
-        Ok(self.conn.execute("DELETE FROM workflows WHERE name = ?1", params![name])? > 0)
+        if self.get_workflow(name)?.is_none() {
+            // no workflow, but its recorded runs go all the same
+            let runs: i64 = self.conn.query_row("SELECT COUNT(*) FROM workflow_runs WHERE workflow = ?1", params![name], |r| r.get(0))?;
+            if runs > 0 {
+                self.commit(Event::WorkflowDeleted { name: name.to_string() })?;
+            }
+            return Ok(false);
+        }
+        self.commit(Event::WorkflowDeleted { name: name.to_string() })?;
+        Ok(true)
     }
 }

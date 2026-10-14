@@ -113,6 +113,26 @@ pub struct HistoryMeta {
     pub source: crate::store::history::Source,
 }
 
+/// A short name for a request that has none: the last two path segments (or the host when the URL has no
+/// path), so two requests to different ids or resources are told apart.
+pub fn title_from_url(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return "New request".to_string();
+    }
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = without_scheme.split(['?', '#']).next().unwrap_or(without_scheme);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        [] => path.to_string(),
+        // only a host (or a lone segment): that is all there is
+        [only] => (*only).to_string(),
+        // the first segment is the host or `{{base}}`: it is not what tells requests apart
+        [_host, rest @ ..] if rest.len() == 1 => rest[0].to_string(),
+        [_host, rest @ ..] => rest[rest.len() - 2..].join("/"),
+    }
+}
+
 impl Tab {
     pub fn new(id: u64, mut state: PersistedState) -> Self {
         reconcile(&mut state.url, &mut state.params);
@@ -186,23 +206,13 @@ impl Tab {
         }
     }
 
-    /// The saved name, or something recognisable made from the URL.
+    /// The saved name, or something recognisable made from the URL: its last two path segments, so
+    /// `/api/v1/users/42` is `users/42` and not just `42`.
     pub fn title(&self) -> String {
         if let Some(name) = &self.name {
             return name.clone();
         }
-        let url = self.state.url.trim();
-        if url.is_empty() {
-            return "New request".to_string();
-        }
-        let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let path = without_scheme.split(['?', '#']).next().unwrap_or(without_scheme);
-        let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
-        if last.is_empty() {
-            path.to_string()
-        } else {
-            last.to_string()
-        }
+        title_from_url(&self.state.url)
     }
 
     /// Untouched blank tab: opening something reuses it instead of adding a tab.
@@ -314,9 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn titles_prefer_the_name_then_the_last_path_segment() {
+    fn titles_prefer_the_name_then_the_last_two_path_segments() {
         assert_eq!(tab("").title(), "New request");
-        assert_eq!(tab("https://h.com/api/v2/fixtures/42?x=1").title(), "42");
+        assert_eq!(tab("https://h.com/api/v2/fixtures/42?x=1").title(), "fixtures/42");
         assert_eq!(tab("https://h.com/").title(), "h.com");
         assert_eq!(tab("localhost:3000").title(), "localhost:3000");
         let mut named = tab("https://h.com/a");
@@ -361,6 +371,7 @@ mod tests {
             source: crate::store::history::Source::Cli,
             options: Default::default(),
             sent_values: Default::default(),
+            group: None,
         };
         let tab = Tab::from_entry(1, &entry, &PersistedState::default());
         let meta = tab.opened_from.expect("opened from history");
@@ -409,5 +420,23 @@ mod tests {
         let back = Tab::from_saved(2, saved);
         assert_eq!((back.name.as_deref(), back.saved_id), (Some("N"), Some(7)));
         assert_eq!(back.state.params.len(), 2);
+    }
+
+    #[test]
+    fn a_tab_without_a_name_is_titled_by_the_last_two_path_segments() {
+        for (url, title) in [
+            ("https://h/api/v1/users/42?x=1", "users/42"),
+            ("https://h/orders", "orders"),
+            ("https://h/orders/", "orders"),
+            ("{{base}}/items/{{id}}", "items/{{id}}"),
+            ("{{base}}/x", "x"),
+            ("https://api.example.com", "api.example.com"),
+            ("localhost:3000/a/b/c", "b/c"),
+            ("localhost:3000/a", "a"),
+            ("https://h/search?q=a/b", "search"),
+            ("  ", "New request"),
+        ] {
+            assert_eq!(super::title_from_url(url), title, "{url}");
+        }
     }
 }

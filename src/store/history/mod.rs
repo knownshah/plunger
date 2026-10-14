@@ -9,11 +9,11 @@ use std::path::PathBuf;
 mod variables;
 mod workflows;
 
+use crate::store::log::{self, Event};
+
 pub use variables::AgentVariable;
 pub use workflows::{NewWorkflowRun, WorkflowRunRow, WORKFLOW_RUNS_KEPT};
 
-/// Oldest rows beyond this are pruned on insert so the database can't grow forever.
-const MAX_ROWS: i64 = 1000;
 
 /// Overrides where all app data lives (history, window state, crash log).
 /// For demos and testing: run a copy against a throwaway folder without
@@ -80,6 +80,8 @@ pub struct HistoryEntry {
     /// For a request that was sent: the value each non-secret `{{placeholder}}` had when it went out
     /// (secrets are not kept, and long values are cut).
     pub sent_values: BTreeMap<String, String>,
+    /// The group a saved request is filed under, `Jira` or `Jira/Issues`.
+    pub group: Option<String>,
 }
 
 /// Settings a saved request carries besides its form: how long to wait, whether to follow redirects,
@@ -133,6 +135,46 @@ fn sent_values(state: &PersistedState) -> BTreeMap<String, String> {
         out.insert(name, v.value.chars().take(300).collect());
     }
     out
+}
+
+/// What a committed event did.
+struct Committed {
+    /// The id handed out to a new request or workflow run (0 for other events).
+    id: i64,
+    /// Rows the event changed.
+    changed: usize,
+}
+
+fn io_error(e: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// A group name as it is stored: parts separated by `/` (`Jira/Issues`), each trimmed, none empty, at most
+/// 80 characters in all. Empty input is no group.
+pub fn normalize_group(raw: &str) -> Result<Option<String>, String> {
+    let parts: Vec<&str> = raw.split('/').map(str::trim).collect();
+    if parts.iter().all(|p| p.is_empty()) {
+        return Ok(None);
+    }
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(format!("`{raw}` is not a group name: a group is like `Jira` or `Jira/Issues`, with no empty part."));
+    }
+    let joined = parts.join("/");
+    if joined.chars().count() > 80 {
+        return Err("A group name is at most 80 characters.".to_string());
+    }
+    if joined.chars().any(char::is_control) {
+        return Err("A group name cannot contain control characters.".to_string());
+    }
+    Ok(Some(joined))
+}
+
+/// True when `group` is `wanted` or lies under it (`Jira/Issues` is under `Jira`), ignoring case.
+pub fn group_matches(group: Option<&str>, wanted: &str) -> bool {
+    let wanted = wanted.trim().trim_matches('/').to_ascii_lowercase();
+    let Some(group) = group else { return wanted.is_empty() };
+    let group = group.to_ascii_lowercase();
+    group == wanted || group.starts_with(&format!("{wanted}/"))
 }
 
 /// Rows that don't fit the fixed columns, stored as one JSON blob so new
@@ -204,10 +246,14 @@ fn body_mode_from_str(s: &str) -> BodyMode {
 
 pub struct History {
     conn: Connection,
+    /// The audit log this database is the result of; None for a database that lives only in memory.
+    log_path: Option<PathBuf>,
+    /// The size at which the log is moved aside and started again.
+    rotate_at: u64,
 }
 
 const COLUMNS: &str = "id, created_at, method, url, headers_text, body_mode, json_body, urlencoded_body, raw_body, \
-                       status, elapsed_ms, extra_json, name, source";
+                       status, elapsed_ms, extra_json, name, source, group_name";
 
 /// A request's columns as written to disk: credentials already blanked.
 struct StoredRequest {
@@ -219,6 +265,27 @@ struct StoredRequest {
     urlencoded_body: String,
     raw_body: String,
     extra: String,
+}
+
+impl StoredRequest {
+    fn into_row(self) -> log::RequestRow {
+        log::RequestRow {
+            method: self.method,
+            url: self.url,
+            headers_text: self.headers_text,
+            body_mode: self.body_mode.to_string(),
+            json_body: self.json_body,
+            urlencoded_body: self.urlencoded_body,
+            raw_body: self.raw_body,
+            extra: self.extra,
+        }
+    }
+}
+
+fn now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 impl From<&PersistedState> for StoredRequest {
@@ -251,9 +318,8 @@ impl History {
     pub fn open() -> rusqlite::Result<Self> {
         let dir = app_data_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let history = Self::with_connection(Connection::open(dir.join("history.sqlite3"))?)?;
-        history.scrub_credentials()?;
-        Ok(history)
+        let database = dir.join("history.sqlite3");
+        Self::with_connection(Connection::open(&database)?, Some(log::path_for(&database)))
     }
 
     /// Redacts rows written before redaction existed. Idempotent, so it is
@@ -279,15 +345,15 @@ impl History {
     /// A database at a specific path (tests: two connections, like the window and an agent).
     #[cfg(test)]
     pub fn open_at(path: &std::path::Path) -> Self {
-        Self::with_connection(Connection::open(path).unwrap()).unwrap()
+        Self::with_connection(Connection::open(path).unwrap(), Some(log::path_for(path))).unwrap()
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Self {
-        Self::with_connection(Connection::open_in_memory().unwrap()).unwrap()
+        Self::with_connection(Connection::open_in_memory().unwrap(), None).unwrap()
     }
 
-    fn with_connection(conn: Connection) -> rusqlite::Result<Self> {
+    fn with_connection(conn: Connection, log_path: Option<PathBuf>) -> rusqlite::Result<Self> {
         // The window and an agent (CLI / MCP) can use the database at the same
         // time: write-ahead logging lets readers and a writer coexist, and the
         // busy timeout makes a second writer wait instead of failing.
@@ -345,6 +411,13 @@ impl History {
             [],
         )?;
         conn.execute("CREATE INDEX IF NOT EXISTS workflow_runs_by_name ON workflow_runs (workflow, id)", [])?;
+        let workflow_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(workflows)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !workflow_columns.iter().any(|c| c == "group_name") {
+            conn.execute("ALTER TABLE workflows ADD COLUMN group_name TEXT", [])?;
+        }
         let columns: Vec<String> = conn
             .prepare("PRAGMA table_info(requests)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -356,6 +429,8 @@ impl History {
             // 0 once the history is cleared: a saved request outlives that.
             ("in_history", "in_history INTEGER NOT NULL DEFAULT 1"),
             ("source", "source TEXT NOT NULL DEFAULT 'gui'"),
+            // the group a saved request is filed under ("Jira" or "Jira/Issues")
+            ("group_name", "group_name TEXT"),
         ] {
             if !columns.iter().any(|c| c == column) {
                 conn.execute(&format!("ALTER TABLE requests ADD COLUMN {definition}"), [])?;
@@ -380,7 +455,11 @@ impl History {
                  SELECT RAISE(ABORT, 'a saved request with this exact name already exists');
              END;",
         )?;
-        Ok(Self { conn })
+        let history = Self { conn, log_path, rotate_at: log::ROTATE_BYTES };
+        // rows from before redaction existed are cleaned first, so the log never holds a credential
+        history.scrub_credentials()?;
+        history.init_log()?;
+        Ok(history)
     }
 
     /// Records a request sent from the window. Returns the new row's id.
@@ -393,6 +472,218 @@ impl History {
         self.insert_from(state, status, elapsed_ms, Source::Gui)
     }
 
+    // ---- the audit log: every change is an event, appended before it is committed ----------------
+
+    /// Applies `event` and records it in the audit log, in one transaction that also serialises writers
+    /// across processes: apply (an error here rolls back and logs nothing), append the line and sync it,
+    /// then commit. A crash after the append and before the commit leaves the log ahead of the tables,
+    /// and the next open replays the difference.
+    fn commit(&self, mut event: Event) -> rusqlite::Result<Committed> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match self.commit_in_transaction(&mut event) {
+            Ok(done) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(done)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_in_transaction(&self, event: &mut Event) -> rusqlite::Result<Committed> {
+        let mut state = match log::read_state(&self.conn)? {
+            Some(state) => state,
+            None => self.fresh_state()?,
+        };
+        // lines another process appended and did not apply (it stopped in between)
+        self.catch_up(&mut state)?;
+        self.rotate_if_large(&mut state)?;
+        let mut id = 0;
+        match event {
+            Event::RequestAdded { id: slot, .. } => {
+                state.last_request_id += 1;
+                *slot = state.last_request_id;
+                id = *slot;
+            }
+            Event::WorkflowRunRecorded { id: slot, .. } => {
+                state.last_run_id += 1;
+                *slot = state.last_run_id;
+                id = *slot;
+            }
+            _ => {}
+        }
+        let applied = log::apply(&self.conn, event)?;
+        self.append_entry(&mut state, event.clone())?;
+        log::write_state(&self.conn, &state)?;
+        Ok(Committed { id, changed: applied.changed })
+    }
+
+    /// A log that has grown past `rotate_at` is kept as `audit.<seq>.log` and a new one is started with a
+    /// snapshot that names the hash it continues, so the chain stays verifiable across the files.
+    fn rotate_if_large(&self, state: &mut log::State) -> rusqlite::Result<()> {
+        let Some(path) = &self.log_path else { return Ok(()) };
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size < self.rotate_at || state.seq == 0 {
+            return Ok(());
+        }
+        let archived = log::archive(path, state.seq).map_err(io_error)?;
+        let name = archived.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut snapshot = log::snapshot_of(&self.conn, Some(format!("continues the log kept as {name}")))?;
+        snapshot.continues = Some(state.hash.clone());
+        state.offset = 0;
+        self.append_entry(state, Event::Snapshot(snapshot))
+    }
+
+    #[cfg(test)]
+    pub fn rotate_at(mut self, bytes: u64) -> Self {
+        self.rotate_at = bytes;
+        self
+    }
+
+    fn append_entry(&self, state: &mut log::State, event: Event) -> rusqlite::Result<()> {
+        match &self.log_path {
+            Some(path) => {
+                let (entry, offset) = log::append(path, state, event).map_err(io_error)?;
+                state.seq = entry.seq;
+                state.hash = entry.hash;
+                state.offset = offset;
+            }
+            None => state.seq += 1,
+        }
+        Ok(())
+    }
+
+    /// The state for a database the log has not seen: ids continue after the ones already there.
+    fn fresh_state(&self) -> rusqlite::Result<log::State> {
+        let mut state = log::State::fresh();
+        state.last_request_id = self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM requests", [], |r| r.get(0))?;
+        state.last_run_id = self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM workflow_runs", [], |r| r.get(0))?;
+        Ok(state)
+    }
+
+    /// Applies the log lines after `state.offset` that the tables do not have yet.
+    fn catch_up(&self, state: &mut log::State) -> rusqlite::Result<usize> {
+        let Some(path) = &self.log_path else { return Ok(0) };
+        let mut applied = 0;
+        for (entry, offset) in log::read_from(path, state.offset).map_err(io_error)? {
+            // the first line of a rotated log follows the file that was set aside: its snapshot says so
+            let continues_archive = state.seq == 0
+                && matches!(&entry.event, Event::Snapshot(s) if s.continues.as_deref() == Some(entry.prev.as_str()));
+            if (entry.prev != state.hash && !continues_archive) || !entry.is_sound() {
+                // not the next line of this chain: leave it for `audit verify` to report
+                break;
+            }
+            log::apply(&self.conn, &entry.event)?;
+            match &entry.event {
+                Event::RequestAdded { id, .. } => state.last_request_id = state.last_request_id.max(*id),
+                Event::WorkflowRunRecorded { id, .. } => state.last_run_id = state.last_run_id.max(*id),
+                Event::Snapshot(s) => {
+                    state.last_request_id = state.last_request_id.max(s.requests.iter().map(|r| r.id).max().unwrap_or(0));
+                    state.last_run_id = state.last_run_id.max(s.runs.iter().map(|r| r.id).max().unwrap_or(0));
+                }
+                _ => {}
+            }
+            state.seq = entry.seq;
+            state.hash = entry.hash;
+            state.offset = offset;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// At open: start the log on a database that has none (a snapshot as its first line), or catch the
+    /// tables up with a log that is ahead of them.
+    fn init_log(&self) -> rusqlite::Result<()> {
+        log::ensure_state_table(&self.conn)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.init_log_in_transaction();
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT"),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn init_log_in_transaction(&self) -> rusqlite::Result<()> {
+        match log::read_state(&self.conn)? {
+            Some(mut state) => {
+                // the log was deleted under a running database: say so, in a new line that does not
+                // follow the old chain, so the gap shows when it is verified
+                let missing = self.log_path.as_ref().is_some_and(|p| !p.exists()) && state.seq > 0;
+                if missing {
+                    let note = Some("the audit log file was missing and has been started again".to_string());
+                    let snapshot = log::snapshot_of(&self.conn, note)?;
+                    state.offset = 0;
+                    self.append_entry(&mut state, Event::Snapshot(snapshot))?;
+                    return log::write_state(&self.conn, &state);
+                }
+                if self.catch_up(&mut state)? > 0 {
+                    log::write_state(&self.conn, &state)?;
+                }
+                Ok(())
+            }
+            None => {
+                let mut state = self.fresh_state()?;
+                match &self.log_path {
+                    Some(path) => {
+                        let existing = log::read_from(path, 0).map_err(io_error)?;
+                        if existing.is_empty() {
+                            // a database with no log: the log starts with everything that is in it
+                            let snapshot = log::snapshot_of(&self.conn, None)?;
+                            self.append_entry(&mut state, Event::Snapshot(snapshot))?;
+                        } else {
+                            // a log with no database state: the tables are what the log says
+                            for table in ["requests", "workflows", "workflow_runs", "agent_variables"] {
+                                self.conn.execute(&format!("DELETE FROM {table}"), [])?;
+                            }
+                            state = log::State::fresh();
+                            self.catch_up(&mut state)?;
+                        }
+                    }
+                    None => state.seq = 0,
+                }
+                log::write_state(&self.conn, &state)
+            }
+        }
+    }
+
+    /// Rebuilds the tables from the audit log: they are emptied and every entry is applied again. Returns
+    /// the number of entries applied. The log is not changed.
+    pub fn rebuild_from_log(&self) -> rusqlite::Result<u64> {
+        let Some(path) = &self.log_path else { return Ok(0) };
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> rusqlite::Result<u64> {
+            for table in ["requests", "workflows", "workflow_runs", "agent_variables"] {
+                self.conn.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            let mut state = log::State::fresh();
+            let applied = self.catch_up(&mut state)? as u64;
+            if state.offset != std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) {
+                return Err(io_error(std::io::Error::other(
+                    "the audit log does not verify, so the database was left as it was (run `plunger audit verify`)",
+                )));
+            }
+            log::write_state(&self.conn, &state)?;
+            Ok(applied)
+        })();
+        match result {
+            Ok(n) => self.conn.execute_batch("COMMIT").map(|_| n),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// The audit log of this database, when it has one.
+    pub fn log_path(&self) -> Option<&std::path::Path> {
+        self.log_path.as_deref()
+    }
+
     /// Records a sent request, noting who sent it. Returns the new row's id.
     pub fn insert_from(
         &self,
@@ -401,14 +692,8 @@ impl History {
         elapsed_ms: Option<u128>,
         source: Source,
     ) -> rusqlite::Result<i64> {
-        let id = self.insert_row(state, status, elapsed_ms, None, source)?;
-        // Only unnamed history is pruned; saved requests are kept however many there are.
-        self.conn.execute(
-            "DELETE FROM requests WHERE name IS NULL AND id NOT IN
-                (SELECT id FROM requests WHERE name IS NULL ORDER BY id DESC LIMIT ?1)",
-            params![MAX_ROWS],
-        )?;
-        Ok(id)
+        // only unnamed history is pruned (when the event is applied); saved requests are kept however many there are
+        self.insert_row(state, status, elapsed_ms, None, source)
     }
 
     /// Saves a request under `name` without adding it to the history list.
@@ -435,9 +720,7 @@ impl History {
         name: Option<&str>,
         source: Source,
     ) -> rusqlite::Result<i64> {
-        let created_at = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
+        let created_at = now();
         let mut row = StoredRequest::from(state);
         if name.is_none() {
             // a sent request remembers what its placeholders stood for, so a parameterised one can be
@@ -449,73 +732,38 @@ impl History {
                 row.extra = serde_json::to_string(&extra).unwrap_or(row.extra);
             }
         }
-        self.conn.execute(
-            "INSERT INTO requests
-                (created_at, method, url, headers_text, body_mode, json_body, urlencoded_body, raw_body,
-                 status, elapsed_ms, extra_json, name, in_history, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                created_at,
-                row.method,
-                row.url,
-                row.headers_text,
-                row.body_mode,
-                row.json_body,
-                row.urlencoded_body,
-                row.raw_body,
-                status.map(|s| s as i64),
-                elapsed_ms.map(|e| e as i64),
-                row.extra,
-                name,
-                // A request saved directly (not from a send) isn't part of the history.
-                name.is_none(),
-                source.as_str(),
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        let applied = self.commit(Event::RequestAdded {
+            id: 0, // handed out by `commit`
+            created_at,
+            source: source.as_str().to_string(),
+            name: name.map(str::to_string),
+            // A request saved directly (not from a send) isn't part of the history.
+            in_history: name.is_none(),
+            status: status.map(|s| s as i64),
+            elapsed_ms: elapsed_ms.map(|e| e as i64),
+            row: row.into_row(),
+        })?;
+        Ok(applied.id)
     }
 
     /// Overwrites a saved request's contents with `state`. Returns false if
     /// the row no longer exists.
     pub fn update_request(&self, id: i64, state: &PersistedState) -> rusqlite::Result<bool> {
+        let Some(current) = self.get(id)? else { return Ok(false) };
         let mut row = StoredRequest::from(state);
         // saving the form again (the window's Ctrl+S) must not drop the options an agent saved with it
-        if let Some(options) = self.get(id)?.map(|e| e.options).filter(|o| !o.is_empty()) {
+        if !current.options.is_empty() {
             let mut extra: Extra = serde_json::from_str(&row.extra).unwrap_or_default();
-            extra.options = options;
+            extra.options = current.options;
             row.extra = serde_json::to_string(&extra).unwrap_or(row.extra);
         }
-        let changed = self.conn.execute(
-            "UPDATE requests SET method = ?1, url = ?2, headers_text = ?3, body_mode = ?4, json_body = ?5,
-                urlencoded_body = ?6, raw_body = ?7, extra_json = ?8
-             WHERE id = ?9",
-            params![
-                row.method,
-                row.url,
-                row.headers_text,
-                row.body_mode,
-                row.json_body,
-                row.urlencoded_body,
-                row.raw_body,
-                row.extra,
-                id
-            ],
-        )?;
-        Ok(changed > 0)
+        Ok(self.commit(Event::RequestUpdated { id, row: row.into_row() })?.changed > 0)
     }
 
     /// Names (saves) a row, or with `None` un-saves it. A saved request that is
     /// no longer in the history list has nothing left to show, so it's deleted.
     pub fn set_name(&self, id: i64, name: Option<&str>) -> rusqlite::Result<()> {
-        match name {
-            Some(name) => {
-                self.conn.execute("UPDATE requests SET name = ?1 WHERE id = ?2", params![name, id])?;
-            }
-            None => {
-                self.conn.execute("DELETE FROM requests WHERE id = ?1 AND in_history = 0", params![id])?;
-                self.conn.execute("UPDATE requests SET name = NULL WHERE id = ?1", params![id])?;
-            }
-        }
+        self.commit(Event::RequestNamed { id, name: name.map(str::to_string) })?;
         Ok(())
     }
 
@@ -528,7 +776,7 @@ impl History {
     pub fn search_saved(&self, term: &str) -> rusqlite::Result<Vec<HistoryEntry>> {
         self.query(
             &format!(
-                "SELECT {COLUMNS} FROM requests WHERE name IS NOT NULL AND ({MATCHES}) ORDER BY name COLLATE NOCASE, id"
+                "SELECT {COLUMNS} FROM requests WHERE name IS NOT NULL AND ({MATCHES}) ORDER BY COALESCE(group_name, '') COLLATE NOCASE, name COLLATE NOCASE, id"
             ),
             params![like_pattern(term)],
         )
@@ -544,7 +792,16 @@ impl History {
         let mut extra: Extra = serde_json::from_str(&raw).unwrap_or_default();
         extra.options = options.clone();
         let text = serde_json::to_string(&extra).unwrap_or_default();
-        Ok(self.conn.execute("UPDATE requests SET extra_json = ?1 WHERE id = ?2", params![text, id])? > 0)
+        Ok(self.commit(Event::RequestExtraSet { id, extra: text })?.changed > 0)
+    }
+
+    /// Files a saved request under `group` (None takes it out of its group). Returns false when there
+    /// is no such request.
+    pub fn set_group(&self, id: i64, group: Option<&str>) -> rusqlite::Result<bool> {
+        if self.get(id)?.is_none() {
+            return Ok(false);
+        }
+        Ok(self.commit(Event::RequestGrouped { id, group: group.map(str::to_string) })?.changed > 0)
     }
 
     /// One request (history or saved) by id.
@@ -584,6 +841,7 @@ impl History {
                 elapsed_ms: row.get(10)?,
                 name: row.get(12)?,
                 source: Source::parse(&row.get::<_, String>(13)?),
+                group: row.get(14)?,
             })
         })?;
         rows.collect()
@@ -592,8 +850,7 @@ impl History {
     /// Empties the history list. Saved requests are kept (and stay in the
     /// Saved list); they just stop appearing under History.
     pub fn clear(&self) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM requests WHERE name IS NULL", [])?;
-        self.conn.execute("UPDATE requests SET in_history = 0", [])?;
+        self.commit(Event::HistoryCleared)?;
         Ok(())
     }
 }
@@ -637,7 +894,7 @@ mod tests {
     }
 
     fn history() -> History {
-        History::with_connection(Connection::open_in_memory().unwrap()).unwrap()
+        History::with_connection(Connection::open_in_memory().unwrap(), None).unwrap()
     }
 
     fn state(url: &str, mode: BodyMode) -> PersistedState {
@@ -797,24 +1054,24 @@ X-Api-Key:");
         )
         .unwrap();
 
-        let h = History::with_connection(conn).unwrap();
+        let h = History::with_connection(conn, None).unwrap();
         let rows = h.search_recent("", 10).unwrap();
         assert_eq!(rows[0].url, "http://legacy");
         assert!(rows[0].params.is_empty() && rows[0].multipart_fields.is_empty());
         // opening again must not try to add the column twice
-        let h2 = History::with_connection(h.conn).unwrap();
+        let h2 = History::with_connection(h.conn, None).unwrap();
         h2.insert(&state("http://new", BodyMode::None), None, None).unwrap();
     }
 
     #[test]
     fn old_rows_are_pruned_beyond_the_cap() {
         let h = history();
-        for i in 0..(MAX_ROWS + 25) {
+        for i in 0..(crate::store::log::MAX_HISTORY_ROWS + 25) {
             h.insert(&state(&format!("http://x/{i}"), BodyMode::None), Some(200), Some(1)).unwrap();
         }
-        let rows = h.search_recent("", MAX_ROWS + 100).unwrap();
-        assert_eq!(rows.len() as i64, MAX_ROWS);
-        assert_eq!(rows[0].url, format!("http://x/{}", MAX_ROWS + 24));
+        let rows = h.search_recent("", crate::store::log::MAX_HISTORY_ROWS + 100).unwrap();
+        assert_eq!(rows.len() as i64, crate::store::log::MAX_HISTORY_ROWS);
+        assert_eq!(rows[0].url, format!("http://x/{}", crate::store::log::MAX_HISTORY_ROWS + 24));
         assert_eq!(rows.last().unwrap().url, "http://x/25");
     }
 
@@ -887,7 +1144,7 @@ X-Api-Key:");
         let h = history();
         let keep = h.insert(&state("http://keep", BodyMode::None), None, None).unwrap();
         h.set_name(keep, Some("Keep")).unwrap();
-        for i in 0..(MAX_ROWS + 5) {
+        for i in 0..(crate::store::log::MAX_HISTORY_ROWS + 5) {
             h.insert(&state(&format!("http://x/{i}"), BodyMode::None), None, None).unwrap();
         }
         assert_eq!(h.list_saved().unwrap().len(), 1);
@@ -917,8 +1174,8 @@ X-Api-Key:");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("h.sqlite3");
         let _ = std::fs::remove_file(&path);
-        let window = History::with_connection(Connection::open(&path).unwrap()).unwrap();
-        let agent = History::with_connection(Connection::open(&path).unwrap()).unwrap();
+        let window = History::with_connection(Connection::open(&path).unwrap(), Some(crate::store::log::path_for(&path))).unwrap();
+        let agent = History::with_connection(Connection::open(&path).unwrap(), Some(crate::store::log::path_for(&path))).unwrap();
         let before = window.data_version();
         agent.insert_from(&state("http://x", BodyMode::None), Some(200), Some(1), Source::Cli).unwrap();
         assert_ne!(window.data_version(), before);
@@ -977,5 +1234,58 @@ X-Api-Key:");
         // a saved request is a template: it keeps no values
         let id = h.save_new(&state, "tmpl").unwrap();
         assert!(h.get(id).unwrap().unwrap().sent_values.is_empty());
+    }
+
+    #[test]
+    fn group_names_are_tidied_and_matched_with_what_is_under_them() {
+        assert_eq!(normalize_group("  Jira / Issues ").unwrap(), Some("Jira/Issues".to_string()));
+        assert_eq!(normalize_group("Jira").unwrap(), Some("Jira".to_string()));
+        assert_eq!(normalize_group("   ").unwrap(), None);
+        assert_eq!(normalize_group("").unwrap(), None);
+        for bad in ["Jira//Issues", "/Jira", "Jira/", "a\u{7}b", &"x".repeat(81)] {
+            assert!(normalize_group(bad).is_err(), "{bad:?}");
+        }
+        assert!(group_matches(Some("Jira"), "jira"));
+        assert!(group_matches(Some("Jira/Issues"), "Jira"));
+        assert!(group_matches(Some("Jira/Issues"), "Jira/Issues"));
+        assert!(!group_matches(Some("Jira/Issues"), "Jira/Boards"));
+        assert!(!group_matches(Some("Jiraffe"), "Jira"), "a prefix of the name is not the group");
+        assert!(!group_matches(None, "Jira"));
+    }
+
+    #[test]
+    fn a_saved_request_and_a_workflow_keep_their_group_and_the_list_is_ordered_by_it() {
+        let h = history();
+        let state = PersistedState { url: "http://h/a".into(), ..Default::default() };
+        let a = h.save_new(&state, "b request").unwrap();
+        let b = h.save_new(&state, "a request").unwrap();
+        let c = h.save_new(&state, "c request").unwrap();
+        assert!(h.set_group(a, Some("Jira")).unwrap());
+        assert!(h.set_group(b, Some("GitLab")).unwrap());
+        assert!(!h.set_group(9999, Some("x")).unwrap());
+        let names: Vec<(String, Option<String>)> =
+            h.list_saved().unwrap().into_iter().map(|e| (e.name.unwrap(), e.group)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("c request".to_string(), None),
+                ("a request".to_string(), Some("GitLab".to_string())),
+                ("b request".to_string(), Some("Jira".to_string())),
+            ],
+            "ungrouped first, then by group, then by name"
+        );
+        assert!(h.set_group(c, Some("Jira/Issues")).unwrap());
+        assert!(h.set_group(a, None).unwrap());
+        assert_eq!(h.get(a).unwrap().unwrap().group, None);
+
+        h.save_workflow("flow", "[]").unwrap();
+        assert!(h.set_workflow_group("flow", Some("Jira")).unwrap());
+        assert_eq!(h.workflow_groups().unwrap().get("flow").map(String::as_str), Some("Jira"));
+        // saving the workflow again does not drop its group
+        h.save_workflow("flow", "[]").unwrap();
+        assert_eq!(h.workflow_groups().unwrap().get("flow").map(String::as_str), Some("Jira"));
+        // and saving the form again does not drop a request's group
+        h.update_request(c, &state).unwrap();
+        assert_eq!(h.get(c).unwrap().unwrap().group.as_deref(), Some("Jira/Issues"));
     }
 }

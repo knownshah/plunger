@@ -17,6 +17,87 @@ enum RowAction {
     Commit(String),
     CancelRename,
     Unsave,
+    /// File the saved request under a group (None: take it out of its group).
+    MoveToGroup(Option<String>),
+}
+
+/// The "Move to group" submenu: the groups there are, no group, and a field for a new one. Returns the
+/// choice (`Some(None)` is "no group").
+pub(super) fn move_to_group_menu(ui: &mut egui::Ui, groups: &[String], current: Option<&str>, input: &mut String) -> Option<Option<String>> {
+    let mut chosen = None;
+    ui.menu_button("Move to group", |ui| {
+        if ui.add_enabled(current.is_some(), egui::Button::new("No group")).clicked() {
+            chosen = Some(None);
+            ui.close();
+        }
+        for group in groups {
+            if ui.add_enabled(current != Some(group.as_str()), egui::Button::new(group)).clicked() {
+                chosen = Some(Some(group.clone()));
+                ui.close();
+            }
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            let edit = ui.add(theme::field(input).hint_text("New group").desired_width(140.0));
+            let add = ui.button("Add").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if add {
+                match crate::store::history::normalize_group(input) {
+                    Ok(Some(name)) => {
+                        chosen = Some(Some(name));
+                        input.clear();
+                        ui.close();
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        ui.colored_label(palette().error, message);
+                    }
+                }
+            }
+        });
+    });
+    chosen
+}
+
+/// A group's title row in a list: the path, a count, and a caret. True when it was clicked.
+pub(super) fn group_header(ui: &mut egui::Ui, path: &str, count: usize, collapsed: bool) -> bool {
+    let depth = path.matches('/').count() as f32;
+    let weak = ui.visuals().weak_text_color();
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_space(depth * 10.0 + 2.0);
+            let caret_room = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover()).0;
+            let c = caret_room.center();
+            let points = if collapsed {
+                vec![c + egui::vec2(-2.5, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.5, 4.0)]
+            } else {
+                vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.0)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(points, weak, egui::Stroke::NONE));
+            let name = path.rsplit('/').next().unwrap_or(path);
+            ui.add(
+                egui::Label::new(egui::RichText::new(format!("{name}  {count}")).small().strong().color(weak))
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(if collapsed { format!("Expand {path}") } else { format!("Collapse {path}") })
+        })
+        .inner;
+    response.clicked()
+}
+
+/// Whether `path` or a group above it is folded away.
+pub(super) fn group_is_hidden(path: &str, collapsed: &std::collections::HashSet<String>) -> bool {
+    let mut prefix = String::new();
+    for part in path.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if collapsed.contains(&prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A timestamp for a tooltip: in the user's time zone when the system says what it is, else UTC.
@@ -59,6 +140,7 @@ impl ApiTesterApp {
                 let mut actions: Vec<(HistoryEntry, &'static str, RowAction)> = Vec::new();
                 let mut clear = false;
                 let mut workflow_action: Option<super::workflows::ListAction> = None;
+                let mut toggled_group: Option<String> = None;
                 let workflow_selected = self.workflow_view.as_ref().map(|v| v.name.clone());
                 // Each list highlights its own link: the saved request being
                 // edited, and the history row this tab last came from or sent.
@@ -80,11 +162,41 @@ impl ApiTesterApp {
 
                     section_header(ui, "SAVED", self.saved_entries.len(), &mut self.saved_open, |_| {});
                     if self.saved_open {
-                        for entry in &self.saved_entries {
-                            let rename = self.renaming.as_mut().filter(|r| r.id == entry.id && r.list == "saved");
-                            let is_selected = saved_selected == Some(entry.id);
-                            if let Some(action) = entry_row(ui, "saved", entry, is_selected, rename, true) {
-                                actions.push((entry.clone(), "saved", action));
+                        // the list is ordered by group, so each run of one group is one block under its header
+                        let mut groups: Vec<String> = self.saved_entries.iter().filter_map(|e| e.group.clone()).collect();
+                        groups.dedup();
+                        let mut run_start = 0;
+                        while run_start < self.saved_entries.len() {
+                            let group = self.saved_entries[run_start].group.clone();
+                            let run_end = self.saved_entries[run_start..]
+                                .iter()
+                                .position(|e| e.group != group)
+                                .map_or(self.saved_entries.len(), |n| run_start + n);
+                            let run = &self.saved_entries[run_start..run_end];
+                            run_start = run_end;
+                            let hidden = !filtering && group.as_deref().is_some_and(|g| group_is_hidden(g, &self.collapsed_groups));
+                            if let Some(path) = &group {
+                                let collapsed = self.collapsed_groups.contains(path);
+                                if group_header(ui, path, run.len(), collapsed && !filtering) {
+                                    toggled_group = Some(path.clone());
+                                }
+                            }
+                            if hidden {
+                                continue;
+                            }
+                            let mut rows = |ui: &mut egui::Ui| {
+                                for entry in run {
+                                    let rename = self.renaming.as_mut().filter(|r| r.id == entry.id && r.list == "saved");
+                                    let is_selected = saved_selected == Some(entry.id);
+                                    if let Some(action) = entry_row(ui, "saved", entry, is_selected, rename, true, &groups, &mut self.group_input) {
+                                        actions.push((entry.clone(), "saved", action));
+                                    }
+                                }
+                            };
+                            if group.is_some() {
+                                ui.indent(("group-rows", run_end), |ui| rows(ui));
+                            } else {
+                                rows(ui);
                             }
                         }
                         if self.saved_entries.is_empty() && filtering {
@@ -95,7 +207,14 @@ impl ApiTesterApp {
                     }
 
                     if !filtering {
-                        workflow_action = super::workflows::sidebar_section(ui, &self.workflows, &mut self.workflows_open, workflow_selected.as_deref());
+                        workflow_action = super::workflows::sidebar_section(
+                            ui,
+                            &self.workflows,
+                            &mut self.workflows_open,
+                            workflow_selected.as_deref(),
+                            &self.collapsed_groups,
+                            &mut self.group_input,
+                        );
                     }
 
                     ui.add_space(8.0);
@@ -111,7 +230,7 @@ impl ApiTesterApp {
                             // A row in both lists is renamed where it was double-clicked.
                             let rename = self.renaming.as_mut().filter(|r| r.id == entry.id && r.list == "history");
                             let is_selected = history_selected == Some(entry.id);
-                            if let Some(action) = entry_row(ui, "history", entry, is_selected, rename, false) {
+                            if let Some(action) = entry_row(ui, "history", entry, is_selected, rename, false, &[], &mut self.group_input) {
                                 actions.push((entry.clone(), "history", action));
                             }
                         }
@@ -133,6 +252,11 @@ impl ApiTesterApp {
                 if clear {
                     self.clear_history();
                 }
+                if let Some(path) = toggled_group {
+                    if !self.collapsed_groups.remove(&path) {
+                        self.collapsed_groups.insert(path);
+                    }
+                }
                 if let Some(action) = workflow_action {
                     self.apply_workflow_action(&ui.ctx().clone(), action);
                 }
@@ -146,6 +270,12 @@ impl ApiTesterApp {
                         }
                         RowAction::CancelRename => self.renaming = None,
                         RowAction::Unsave => self.unsave(entry.id),
+                        RowAction::MoveToGroup(group) => {
+                            if let Some(h) = &self.history {
+                                let _ = h.set_group(entry.id, group.as_deref());
+                            }
+                            self.refresh_lists();
+                        }
                     }
                 }
             });
@@ -188,6 +318,7 @@ pub(super) fn section_header(ui: &mut egui::Ui, title: &str, count: usize, open:
 /// One request in the sidebar: an optional name line, then status dot,
 /// method and URL. The whole row is the click target; the name field (while
 /// renaming) and the remove icon sit on top of it.
+#[allow(clippy::too_many_arguments)]
 fn entry_row(
     ui: &mut egui::Ui,
     list: &str,
@@ -195,6 +326,8 @@ fn entry_row(
     selected: bool,
     rename: Option<&mut Rename>,
     removable: bool,
+    groups: &[String],
+    group_input: &mut String,
 ) -> Option<RowAction> {
     let two_lines = entry.name.is_some() || rename.is_some();
     let height = if two_lines { TWO_LINES } else { ONE_LINE };
@@ -306,6 +439,27 @@ fn entry_row(
         other => format!("  \u{b7}  sent by an agent ({})", other.as_str()),
     };
     let response = response.on_hover_text(format!("{}\n{when}  \u{b7}  {timing}{sender}\nDouble-click to {verb}", entry.url));
+    if removable {
+        response.context_menu(|ui| {
+            if ui.button("Open").clicked() {
+                action = Some(RowAction::Open);
+                ui.close();
+            }
+            if ui.button("Rename").clicked() {
+                action = Some(RowAction::StartRename);
+                ui.close();
+            }
+            if let Some(chosen) = move_to_group_menu(ui, groups, entry.group.as_deref(), group_input) {
+                action = Some(RowAction::MoveToGroup(chosen));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Remove from Saved").clicked() {
+                action = Some(RowAction::Unsave);
+                ui.close();
+            }
+        });
+    }
     if action.is_none() {
         if response.double_clicked() {
             action = Some(RowAction::StartRename);
@@ -340,6 +494,19 @@ mod tests {
     fn anything_else_is_left_alone() {
         assert_eq!(friendly_timestamp("t"), "t");
         assert_eq!(friendly_timestamp("2026-09-24 11:33:44"), "2026-09-24 11:33:44");
+    }
+
+    #[test]
+    fn a_folded_group_hides_what_is_under_it() {
+        use super::group_is_hidden;
+        use std::collections::HashSet;
+        let collapsed: HashSet<String> = ["Jira".to_string()].into();
+        assert!(group_is_hidden("Jira", &collapsed));
+        assert!(group_is_hidden("Jira/Issues", &collapsed));
+        assert!(!group_is_hidden("GitLab", &collapsed));
+        assert!(!group_is_hidden("Jiraffe", &collapsed), "a name that only starts the same is another group");
+        let only_child: HashSet<String> = ["Jira/Issues".to_string()].into();
+        assert!(!group_is_hidden("Jira", &only_child));
     }
 
     #[test]

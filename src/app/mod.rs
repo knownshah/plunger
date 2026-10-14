@@ -17,6 +17,7 @@ mod sidebar;
 mod tab;
 mod tabs;
 mod variables_window;
+mod workflow_flow;
 mod workflows;
 
 pub use tab::SavedTab;
@@ -131,6 +132,9 @@ pub struct ApiTesterApp {
     font_sig: (u64, [usize; 7]),
     renaming: Option<Rename>,
     saved_open: bool,
+    /// Groups (full paths) folded away in the sidebar, and the text typed for a new group.
+    collapsed_groups: std::collections::HashSet<String>,
+    group_input: String,
     history_open: bool,
 
     /// Variables an agent set (read from the shared database).
@@ -183,6 +187,8 @@ impl ApiTesterApp {
             font_sig: (u64::MAX, [0; 7]),
             renaming: None,
             saved_open: true,
+            collapsed_groups: std::collections::HashSet::new(),
+            group_input: String::new(),
             history_open: true,
             db_version: None,
             last_db_poll: Instant::now(),
@@ -216,15 +222,24 @@ impl ApiTesterApp {
             return;
         }
         let session = self.tabs[0].state.clone();
-        self.tabs = open_tabs
-            .tabs
-            .into_iter()
-            .map(|mut saved| {
-                saved.state = saved.state.with_session_from(&session);
-                self.next_tab_id += 1;
-                Tab::from_saved(self.next_tab_id, saved)
-            })
-            .collect();
+        let mut tabs = Vec::new();
+        for mut saved in open_tabs.tabs {
+            saved.state = saved.state.with_session_from(&session);
+            self.next_tab_id += 1;
+            let mut tab = Tab::from_saved(self.next_tab_id, saved);
+            // a request that came from the history still says how it went, from its row
+            if let Some(entry) = tab.history_id.and_then(|id| self.history.as_ref().and_then(|h| h.get(id).ok().flatten())) {
+                tab.opened_from = Some(tab::HistoryMeta {
+                    created_at: entry.created_at.clone(),
+                    status: entry.status,
+                    elapsed_ms: entry.elapsed_ms,
+                    source: entry.source,
+                });
+                tab.sent_values = entry.sent_values.clone();
+            }
+            tabs.push(tab);
+        }
+        self.tabs = tabs;
         self.active = open_tabs.active.min(self.tabs.len() - 1);
     }
 

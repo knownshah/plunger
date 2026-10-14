@@ -117,6 +117,27 @@ python scripts/mcp-demo-client.py path\to\plunger.exe
 
 The read-only tools are marked as such, so a client can run them without asking.
 
+## The audit log
+
+Every change Plunger makes to its history is written to `audit.log` first and applied to the database from it: sends (who, when, what, status), saved requests, groups, workflows and their runs, and the variables an agent sets (a secret by name only, never its value). Each line carries the hash of the line before it.
+
+```bash
+plunger audit verify                    # ok with the entry count and head hash, or the first bad entry (exit 4)
+plunger audit show --source mcp --since 1h --action send
+plunger audit head                      # the newest hash, to write down somewhere else
+plunger audit rebuild                   # recreate the database from the log
+```
+
+An agent cannot read or write it: there is no MCP tool for it. What it stops: an edit to the file made without going through Plunger shows up in `verify`. What it does not stop: a process running as you that rewrites the whole file and its hashes (the keyed version is planned, #201).
+
+## What comes back
+
+- `status`, `ok`, `elapsed_ms` and `ttfb_ms` (until the headers arrived), `size_bytes`.
+- A JSON body as `json`, or its outline when it is long; any other text as `body`, cut at `max_body_chars`.
+- A redirect: `final_url` and `redirects` (`[{"status": 301, "url": "..."}]`) when the request was redirected; absent otherwise.
+- A binary body is never returned: `binary: true`, `sha256` and `detected_type` let you check it. On the command line `--out FILE` writes the whole body to a file and the result carries `body_file`.
+- `headers` as `include_headers` says: `all` (the default), `none`, or `relevant` (location, link, retry-after, content type and disposition, etag, rate-limit headers, and a cookie's name without its value). With `select` the default is `none`; `header:Name` in `select` returns one.
+
 ## Variables in a JSON body
 
 A `{{variable}}` inside a JSON string is JSON-escaped for you: a description with a line break, a quote or a backslash arrives as exactly that text, so do not escape it yourself (a value you already escaped would arrive with a visible backslash). Outside a string the value is inserted as JSON, so a variable can be a number, `true`, or a whole array or object:
@@ -137,6 +158,18 @@ An undefined `{{name}}` refuses the request, so a request never goes out with a 
 One request can then create an issue with an optional assignee, labels and epic.
 
 A request you save with `save_request` keeps its `timeout_secs`, `follow_redirects`, `insecure_tls` and `select`, and uses them when it is sent by name (a value in the call wins). Fields a saved request cannot keep (`variables`, `use_saved_bearer`, `extract`, `max_body_chars`) are named in `not_saved` in the result.
+
+## Groups
+
+Saved requests and workflows can be filed under a group so unrelated APIs do not mix: `Jira`, or `Jira/Issues` for one level under it. A group is just a name; there is nothing to create first.
+
+- `save_request` and `save_workflow` take `group`. Left out, a new one has no group and a replaced one keeps its group; an empty string takes it out of its group.
+- `list_saved_requests` and `list_workflows` take an optional `group`, and return each item's `group`. `Jira` includes `Jira/Issues`.
+- `set_group` (`kind`: `request` or `workflow`, `name`, `group`) files one without sending its content again, so an agent can tidy a long flat list.
+- On the command line: `plunger save "create issue" ... --group Jira`, `plunger saved --group Jira`, `plunger saved group "create issue" Jira/Issues`, `plunger workflow save close @steps.json --group Jira`, `plunger workflow list --group Jira`, `plunger workflow group close Jira`.
+- In the window, the sidebar shows a collapsible header per group, and **Move to group** is on a row's right-click menu.
+
+Variables stay shared by everything (see Variables in the window); per-group variables are a possible next step.
 
 ## Workflows
 
@@ -163,7 +196,7 @@ From a terminal: `plunger workflow save shop @steps.json`, `plunger workflow run
 
 Workflows are made by agents (or `plunger workflow save`), but the window shows them: a **WORKFLOWS** section in the sidebar lists each one with its step count and a dot for its last run (green all passed, red a step failed, amber cancelled, grey never run) and how long ago.
 
-Click one to open it. The window shows the steps (the request, what each step keeps with `extract`, the status it expects), **Run** with live progress and a **Cancel** that stops before the next step, an optional "Values for this run" box (`name=value`, one per line), and **Last run**: every recorded run, whoever made it (you, the CLI or an agent over MCP), with each step's status, time and the variables it set (by name; a secret never shows). **Open as request** puts a step in an ordinary tab to try by hand, and **Copy as JSON** copies the steps. Right-click a workflow in the sidebar for Open, Run, Copy as JSON and Delete (which asks first, and removes its recorded runs too).
+Click one to open it. The window draws the steps as a flow: a card per step on a rail of connected dots (coloured by the last or running run; a diamond can be skipped, a square can end the run), with the values a step hands on written on the connector and what the workflow needs from outside listed on top. Each card shows the request, the status it expects and its conditions, **Run** with live progress and a **Cancel** that stops before the next step, an optional "Values for this run" box (`name=value`, one per line), and **Last run**: every recorded run, whoever made it (you, the CLI or an agent over MCP), with each step's status, time and the variables it set (by name; a secret never shows). **Open as request** puts a step in an ordinary tab to try by hand, and **Copy as JSON** copies the steps. Right-click a workflow in the sidebar for Open, Run, Copy as JSON and Delete (which asks first, and removes its recorded runs too).
 
 A run from the window uses the same engine, variables and history as an agent's: its requests appear in the History, and the variables it keeps appear under "Set by agents". **Tools > Workflows** opens the list, and **Ctrl+Shift+R** (Cmd+Shift+R on a Mac) runs the open one.
 

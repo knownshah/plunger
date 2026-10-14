@@ -154,6 +154,60 @@ pub struct AgentResponse {
     /// What to do next, when the response was too big to return whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Milliseconds until the response headers arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u64>,
+    /// Where the request ended up, when it was redirected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+    /// The redirects that were followed, in order (absent when there were none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<RedirectHop>,
+    /// For a binary body: its SHA-256, so the agent can check it without receiving the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// For a binary body: what its first bytes say it is (`png`, `pdf`, `zip`, ...), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_type: Option<String>,
+    /// With `--out` on the command line: the file the whole body was written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_file: Option<String>,
+}
+
+/// One redirect the request followed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RedirectHop {
+    pub status: u16,
+    /// Where it pointed.
+    pub url: String,
+}
+
+/// What the first bytes of a binary body say it is.
+pub fn sniff_type(bytes: &[u8]) -> Option<&'static str> {
+    const SIGNATURES: [(&[u8], &str); 12] = [
+        (b"\x89PNG\r\n\x1a\n", "png"),
+        (b"\xff\xd8\xff", "jpeg"),
+        (b"GIF87a", "gif"),
+        (b"GIF89a", "gif"),
+        (b"%PDF-", "pdf"),
+        (b"PK\x03\x04", "zip"),
+        (b"\x1f\x8b", "gzip"),
+        (b"\x00asm", "wasm"),
+        (b"RIFF", "riff (wav, webp or avi)"),
+        (b"ID3", "mp3"),
+        (b"\x7fELF", "elf executable"),
+        (b"MZ", "windows executable"),
+    ];
+    SIGNATURES.iter().find(|(magic, _)| bytes.starts_with(magic)).map(|(_, name)| *name)
+}
+
+/// The SHA-256 of `bytes`, in lower-case hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut out, b| {
+        out.push_str(&format!("{b:02x}"));
+        out
+    })
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -259,6 +313,16 @@ impl AgentResponse {
                 sent_at: r.sent_at.clone(),
             },
             redacted,
+            ttfb_ms: Some(r.ttfb_ms as u64),
+            final_url: r.redirect_chain.last().map(|(_, to)| scrubber.text(&redact_url(to))),
+            redirects: r
+                .redirect_chain
+                .iter()
+                .map(|(status, to)| RedirectHop { status: *status, url: scrubber.text(&redact_url(to)) })
+                .collect(),
+            sha256: r.binary.as_deref().map(sha256_hex),
+            detected_type: r.binary.as_deref().and_then(sniff_type).map(str::to_string),
+            body_file: None,
             selected: None,
             variables_set: Vec::new(),
             problems: Vec::new(),
@@ -283,6 +347,9 @@ pub struct StoredRequestInfo {
     pub body_type: String,
     /// `{{variables}}` this request needs. Built-ins like `{{$uuid}}` are filled in automatically.
     pub variables_used: Vec<String>,
+    /// The group it is filed under (`Jira`, `Jira/Issues`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// One row of the shared history.
@@ -344,6 +411,7 @@ impl From<&HistoryEntry> for StoredRequestInfo {
                 .collect(),
             body_type: body_type_name(e.body_mode).to_string(),
             variables_used: variables_used(&state),
+            group: e.group.clone(),
         }
     }
 }
@@ -370,5 +438,49 @@ mod tests {
         assert!(text.contains("[redacted:token]") && text.contains("\"user\":{\"id\":7}"));
         assert_eq!(shaped.redacted, vec!["token".to_string()]);
         assert!(Scrubber::only("t", "ab").is_none(), "a value too short to mask is left alone");
+    }
+
+    #[test]
+    fn a_binary_body_is_identified_and_checked_but_never_returned() {
+        // PNG signature, then bytes
+        let bytes: Vec<u8> = [&b"\x89PNG\r\n\x1a\n"[..], &[0u8; 32][..]].concat();
+        assert_eq!(sniff_type(&bytes), Some("png"));
+        assert_eq!(sniff_type(b"%PDF-1.7 ..."), Some("pdf"));
+        assert_eq!(sniff_type(b"PK\x03\x04rest"), Some("zip"));
+        assert_eq!(sniff_type(b"plain"), None);
+        // the well-known SHA-256 of "abc"
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+        let response = crate::domain::model::ResponseData { status: 200, binary: Some(bytes.clone()), size_bytes: bytes.len(), ..Default::default() };
+        let sent = crate::engine::Sent { response, history_id: None, state: PersistedState::default() };
+        let shaped = AgentResponse::from_sent(&sent, &Scrubber::new(&PersistedState::default(), ""), 50_000);
+        assert!(shaped.binary);
+        assert_eq!(shaped.detected_type.as_deref(), Some("png"));
+        assert_eq!(shaped.sha256.as_deref().map(str::len), Some(64));
+        assert!(shaped.json.is_none() && shaped.body.is_none(), "the bytes are not in the result");
+    }
+
+    #[test]
+    fn a_response_says_how_fast_it_started_and_where_a_redirect_went() {
+        let plain = crate::domain::model::ResponseData { status: 200, ttfb_ms: 12, ..Default::default() };
+        let sent = crate::engine::Sent { response: plain, history_id: None, state: PersistedState::default() };
+        let scrubber = Scrubber::new(&PersistedState::default(), "");
+        let shaped = AgentResponse::from_sent(&sent, &scrubber, 50_000);
+        assert_eq!(shaped.ttfb_ms, Some(12));
+        assert!(shaped.final_url.is_none() && shaped.redirects.is_empty(), "nothing about redirects when there were none");
+        let text = serde_json::to_string(&shaped).unwrap();
+        assert!(!text.contains("redirects") && !text.contains("final_url"), "{text}");
+
+        let moved = crate::domain::model::ResponseData {
+            status: 200,
+            redirect_chain: vec![(301, "http://h/new?api_key=SECRETKEY1".into()), (302, "http://h/final".into())],
+            ..Default::default()
+        };
+        let sent = crate::engine::Sent { response: moved, history_id: None, state: PersistedState::default() };
+        let shaped = AgentResponse::from_sent(&sent, &scrubber, 50_000);
+        assert_eq!(shaped.final_url.as_deref(), Some("http://h/final"));
+        assert_eq!(shaped.redirects.iter().map(|r| r.status).collect::<Vec<_>>(), vec![301, 302]);
+        assert!(!shaped.redirects[0].url.contains("SECRETKEY1"), "a credential in a redirect is blanked");
     }
 }

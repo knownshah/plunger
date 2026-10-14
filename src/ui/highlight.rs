@@ -36,7 +36,18 @@ pub fn plain(text: &str, color: Color32) -> LayoutJob {
     job
 }
 
-const COMMAND_WORDS: &[&str] = &["http", "https", "curl", "curl.exe", "invoke-restmethod", "invoke-webrequest", "irm", "iwr", "plunger", "new-object"];
+const COMMAND_WORDS: &[&str] = &[
+    "http",
+    "https",
+    "curl",
+    "curl.exe",
+    "invoke-restmethod",
+    "invoke-webrequest",
+    "irm",
+    "iwr",
+    "plunger",
+    "new-object",
+];
 
 /// A shell command in any of the supported dialects: bash curl, Windows cmd curl, PowerShell. The
 /// command name, `-flags`, quoted strings, `{{placeholders}}`, `$variables`, numbers and the

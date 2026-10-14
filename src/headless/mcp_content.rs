@@ -73,8 +73,8 @@ pub fn read(uri: &str, guide: &str) -> Result<String, String> {
     match uri {
         GUIDE_URI => Ok(guide.to_string()),
         VARIABLES_URI => json(&agent::list_variables()),
-        SAVED_URI => json(&agent::list_saved_requests()?),
-        WORKFLOWS_URI => json(&workflow::list()?),
+        SAVED_URI => json(&agent::list_saved_requests(None)?),
+        WORKFLOWS_URI => json(&workflow::list(None)?),
         HISTORY_URI => json(&agent::get_history(Some(20), None)?),
         _ => {
             if let Some(name) = uri.strip_prefix(SAVED_PREFIX) {
@@ -91,13 +91,13 @@ pub fn read(uri: &str, guide: &str) -> Result<String, String> {
 /// The saved requests and workflows, as resources of their own (so a client can list and open them).
 pub fn dynamic() -> Vec<(String, String, &'static str)> {
     let mut out = Vec::new();
-    if let Ok(saved) = agent::list_saved_requests() {
+    if let Ok(saved) = agent::list_saved_requests(None) {
         for s in saved.into_iter().filter(|s| s.name.is_some()).take(200) {
             let name = s.name.clone().unwrap_or_default();
             out.push((format!("{SAVED_PREFIX}{}", encode_name(&name)), format!("saved request: {name}"), "application/json"));
         }
     }
-    if let Ok(list) = workflow::list() {
+    if let Ok(list) = workflow::list(None) {
         for w in list.workflows {
             out.push((format!("{WORKFLOW_PREFIX}{}", encode_name(&w.name)), format!("workflow: {}", w.name), "application/json"));
         }

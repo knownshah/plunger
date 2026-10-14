@@ -27,7 +27,7 @@ Plunger sends HTTP requests on the user's machine and shows every one of them in
 so the user can see what you sent. Use it instead of running curl.
 
 TOOLS
-- list_saved_requests: the requests the user saved, by name. Check it before building a request from scratch.
+- list_saved_requests: the requests the user saved, by name (optionally one `group`). Check it before building a request from scratch. `group` on save_request / save_workflow files them (`Jira`, `Jira/Issues`); set_group moves one.
 - list_variables: the {{variables}} in use (secrets by name only; `source` says whether the user defined it in the window or an agent set it), the built-ins ($uuid, $timestamp, $randomInt, $env:NAME) and whether a Bearer token is saved.
 - set_variable / delete_variable: keep a value for later requests as {{name}} (for example a token from a login response). It persists, and the user sees it in the window. A secret (or a name like token, password, api_key) goes to the system credential store and is masked in results. You cannot change or delete variables the user defined.
 - send_request: send a request, or a saved one by name (`saved_request`) with overrides. Use `json`, `body` or `form` for the body; `headers` is an object like {\"Accept\": \"application/json\"}. `select: [\"$.data[0].id\", \"header:Location\"]` returns only those values (under `selected`) instead of the whole body and headers, so a big response costs a few tokens; `[?(@.name=='Done')]` filters an array by a field, and if a path cannot be read the whole response is returned with the reason in `problems`. `extract: [{\"name\": \"token\", \"from\": \"json:$.access_token\"}]` keeps a value from the response as {{token}} for later requests in the same call (hidden if it looks like a credential); `variables_set` lists what was set and `problems` anything that did not work. `request.sent_at` is when it was fired.
@@ -90,6 +90,10 @@ pub struct SaveRequestParams {
     /// Replace a saved request that already has this name (otherwise an existing name is refused).
     #[serde(default)]
     pub overwrite: Option<bool>,
+    /// File it under a group, such as "Jira" or "Jira/Issues". Left out, a new request has no group and a
+    /// replaced one keeps its group; an empty string takes it out of its group.
+    #[serde(default)]
+    pub group: Option<String>,
     /// The request, described like send_request does: method, url, headers, json / body / form, options.
     #[serde(flatten)]
     pub request: SendParams,
@@ -102,9 +106,30 @@ pub struct SaveWorkflowParams {
     /// Replace a workflow that already has this name.
     #[serde(default)]
     pub overwrite: Option<bool>,
+    /// File it under a group, such as "Jira". Left out, a replaced workflow keeps its group; an empty string
+    /// takes it out of its group.
+    #[serde(default)]
+    pub group: Option<String>,
     /// The requests, in order. Each is like send_request, plus `extract` (values to keep for later steps) and
     /// `expect_status` (default: any 2xx).
     pub steps: Vec<Step>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ListParams {
+    /// Only the ones in this group, or under it ("Jira" includes "Jira/Issues").
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SetGroupParams {
+    /// `request` (a saved request) or `workflow`.
+    pub kind: String,
+    /// The name of the saved request or workflow.
+    pub name: String,
+    /// The group to file it under, such as "Jira" or "Jira/Issues". An empty string takes it out of its group.
+    pub group: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -211,8 +236,15 @@ impl PlungerMcp {
     /// List the requests the user saved in Plunger, by name, with method, URL, headers and the {{variables}} each
     /// needs. Call this before building a request from scratch: the user may already have the exact call set up.
     #[tool(name = "list_saved_requests", annotations(title = "List saved requests", read_only_hint = true))]
-    async fn list_saved_requests(&self) -> Result<Json<SavedRequestsResult>, String> {
-        blocking(agent::list_saved_requests).await.map(|requests| Json(SavedRequestsResult { requests }))
+    async fn list_saved_requests(&self, Parameters(p): Parameters<ListParams>) -> Result<Json<SavedRequestsResult>, String> {
+        blocking(move || agent::list_saved_requests(p.group.as_deref())).await.map(|requests| Json(SavedRequestsResult { requests }))
+    }
+
+    /// File a saved request or a workflow under a group, such as "Jira" or "Jira/Issues", without touching the
+    /// request or workflow itself. An empty `group` takes it out of its group. Use it to tidy the Saved list.
+    #[tool(name = "set_group", annotations(title = "Move to a group", idempotent_hint = true, destructive_hint = false))]
+    async fn set_group(&self, Parameters(p): Parameters<SetGroupParams>) -> Result<Json<crate::agent::GroupChange>, String> {
+        blocking(move || agent::set_group(&p.kind, &p.name, &p.group)).await.map(Json)
     }
 
     /// Recent requests from the shared history, newest first: who sent them (gui = the user, cli or mcp = an
@@ -270,7 +302,7 @@ impl PlungerMcp {
     /// mistake can be fixed.
     #[tool(name = "save_request", annotations(title = "Save a request", idempotent_hint = true, destructive_hint = false))]
     async fn save_request(&self, Parameters(p): Parameters<SaveRequestParams>) -> Result<Json<ImportedRequest>, String> {
-        blocking(move || agent::save_request(&p.name, p.overwrite.unwrap_or(false), &p.request, Source::Mcp)).await.map(Json)
+        blocking(move || agent::save_request(&p.name, p.overwrite.unwrap_or(false), &p.request, p.group.as_deref(), Source::Mcp)).await.map(Json)
     }
 
     /// One saved request in full: method, URL, headers, body, and the {{variables}} it needs.
@@ -291,7 +323,7 @@ impl PlungerMcp {
     /// `expect_status`. Use it for logins, create-then-fetch flows and any sequence you will repeat.
     #[tool(name = "save_workflow", annotations(title = "Save a workflow", idempotent_hint = true, destructive_hint = false))]
     async fn save_workflow(&self, Parameters(p): Parameters<SaveWorkflowParams>) -> Result<Json<WorkflowInfo>, String> {
-        blocking(move || workflow::save(&p.name, p.steps, p.overwrite.unwrap_or(false))).await.map(Json)
+        blocking(move || workflow::save(&p.name, p.steps, p.overwrite.unwrap_or(false), p.group.as_deref())).await.map(Json)
     }
 
     /// Run a saved workflow: its requests are sent in order, values are carried from one response to the next
@@ -304,8 +336,8 @@ impl PlungerMcp {
 
     /// List the saved workflows with their steps.
     #[tool(name = "list_workflows", annotations(title = "List workflows", read_only_hint = true))]
-    async fn list_workflows(&self) -> Result<Json<WorkflowList>, String> {
-        blocking(workflow::list).await.map(Json)
+    async fn list_workflows(&self, Parameters(p): Parameters<ListParams>) -> Result<Json<WorkflowList>, String> {
+        blocking(move || workflow::list(p.group.as_deref())).await.map(Json)
     }
 
     /// Remove a workflow by name. Returns what was removed.
@@ -414,7 +446,7 @@ mod tests {
             [
                 "delete_saved_request", "delete_variable", "delete_workflow", "export_curl", "get_history", "get_history_entry", "get_saved_request",
                 "import_curl", "list_saved_requests", "list_variables", "list_workflows", "run_workflow", "save_request",
-                "save_workflow", "send_request", "set_variable"
+                "save_workflow", "send_request", "set_group", "set_variable"
             ]
         );
         let send = tools.iter().find(|t| t.name == "send_request").unwrap();
@@ -473,6 +505,12 @@ mod tests {
             problems: vec![],
             outline: None,
             hint: None,
+            ttfb_ms: Some(3),
+            final_url: Some("http://h/final".into()),
+            redirects: vec![crate::engine::RedirectHop { status: 301, url: "http://h/final".into() }],
+            sha256: Some("00".into()),
+            detected_type: Some("png".into()),
+            body_file: Some("out.bin".into()),
         };
         assert_eq!(missing_required_keys(&response), Vec::<String>::new(), "send_request");
 

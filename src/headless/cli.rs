@@ -36,6 +36,11 @@ USAGE
   plunger history [--limit N] [--search TEXT]
                                         Recent requests, newest first (default 20);
                                         --search matches URL, method, name or status
+  plunger audit verify|show|head|rebuild
+                                        The audit log: every change, in order, hash-chained.
+                                        verify finds an edited, removed or reordered line
+                                        (exit 4); show lists it; rebuild recreates the
+                                        database from it
   plunger vars                          List variables (secret values are never shown)
   plunger vars set <name> <value>       Set a variable for later requests ({{name}}); --secret keeps it
                                         in the credential store (use `-` as the value to read stdin)
@@ -161,8 +166,10 @@ plunger workflow show <name>            a workflow's steps
 plunger workflow run <name> [--var name=value ...] [--cleanup]
                                         send the steps in order; stops at the first failure.
                                         --cleanup removes the variables the run stored when it is done
-plunger workflow save <name> <steps> [--overwrite]
+plunger workflow save <name> <steps> [--overwrite] [--group G]
                                         <steps> is JSON, or @file.json, or @- for standard input
+plunger workflow list [--group G]       the workflows (only those in a group, or under it)
+plunger workflow group <name> <group>   file a workflow under a group (an empty group takes it out)
 plunger workflow delete <name>
 
 A workflow is a JSON array of steps. A step is a request (saved_request, or method / url / headers /
@@ -200,6 +207,14 @@ plunger save <name> [--url] <url> [send options] [--overwrite]
 Saves the request without sending it. {{placeholders}} (including in Authorization headers) are
 kept as written. An existing name is refused unless --overwrite is given, which replaces it.
 Options are those of `plunger send`: -X, -H, --json, -d, --form, --timeout, --insecure, --no-follow.
+",
+        "audit" => "\
+plunger audit verify                the log's chain: ok with the number of entries and the head hash, or the first bad entry (exit 4)
+plunger audit show [--source gui|cli|mcp] [--action send|request_saved|variable_set|workflow_run|...] [--since 1h|30m|2d] [--limit N]
+                                    the changes, newest last, as one line each (no bodies, no secret values)
+plunger audit head                  the hash of the newest entry, to write down somewhere else
+plunger audit rebuild               recreate the history database from the log (a log that does not verify is refused)
+The log is audit.log beside the database. No agent tool can read or write it.
 ",
         "history" => "\
 plunger history [--limit N] [--search TEXT]   recent requests, newest first (default 20)
@@ -262,7 +277,10 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
             if opts.params.saved_request.is_none() && opts.params.url.is_none() {
                 return Err(usage_error("Give a saved request name, or --url"));
             }
-            finish_send(agent::send_request(&opts.params, Source::Cli), opts.fail)
+            match opts.out.clone() {
+                Some(file) => finish_send(send_to_file(&opts.params, &file), opts.fail),
+                None => finish_send(agent::send_request(&opts.params, Source::Cli), opts.fail),
+            }
         }
         "curl" => Ok(crate::headless::curl_cli::run(args.rest())),
         "import" => {
@@ -287,7 +305,14 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "saved" => {
             match args.next().as_deref() {
-                None => print_json(&agent::list_saved_requests().map_err(error)?),
+                None => print_json(&agent::list_saved_requests(None).map_err(error)?),
+                Some("--group") => print_json(&agent::list_saved_requests(Some(&args.value("saved --group")?)).map_err(error)?),
+                Some("group") => {
+                    let name = args.value("saved group")?;
+                    let group = args.value("saved group")?;
+                    args.finish()?;
+                    print_json(&agent::set_group("request", &name, &group).map_err(error)?);
+                }
                 Some("show") => print_json(&agent::show_saved_request(&args.value("saved show")?).map_err(error)?),
                 Some("delete") => {
                     let name = args.value("saved delete")?;
@@ -301,9 +326,12 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "save" => {
             let (mut name, mut overwrite, mut opts) = (None, false, SendOptions::default());
+            let mut group: Option<String> = None;
             while let Some(arg) = args.next() {
                 if arg == "--overwrite" {
                     overwrite = true;
+                } else if arg == "--group" {
+                    group = Some(args.value(&arg)?);
                 } else if !opts.take(&arg, &mut args)? {
                     if arg.starts_with('-') {
                         return Err(usage_error(format!("Unexpected argument `{arg}`")));
@@ -318,7 +346,7 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                 }
             }
             let name = name.ok_or_else(|| usage_error("Give the request a name"))?;
-            print_json(&agent::save_request(&name, overwrite, &opts.params, Source::Cli).map_err(error)?);
+            print_json(&agent::save_request(&name, overwrite, &opts.params, group.as_deref(), Source::Cli).map_err(error)?);
             Ok(EXIT_OK)
         }
         "install" => {
@@ -394,7 +422,23 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "workflow" | "workflows" => {
             match args.next().as_deref() {
-                None | Some("list") => print_json(&workflow::list().map_err(error)?),
+                None | Some("list") => {
+                    let mut group: Option<String> = None;
+                    while let Some(arg) = args.next() {
+                        if arg == "--group" {
+                            group = Some(args.value(&arg)?);
+                        } else {
+                            return Err(usage_error(format!("Unexpected argument `{arg}`")));
+                        }
+                    }
+                    print_json(&workflow::list(group.as_deref()).map_err(error)?);
+                }
+                Some("group") => {
+                    let name = args.value("workflow group")?;
+                    let group = args.value("workflow group")?;
+                    args.finish()?;
+                    print_json(&agent::set_group("workflow", &name, &group).map_err(error)?);
+                }
                 Some("show") => print_json(&workflow::get(&args.value("workflow show")?).map_err(error)?),
                 Some("delete") => {
                     let name = args.value("workflow delete")?;
@@ -406,9 +450,12 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                     let name = args.value("workflow save")?;
                     let mut steps = None;
                     let mut overwrite = false;
+                    let mut group: Option<String> = None;
                     while let Some(arg) = args.next() {
                         if arg == "--overwrite" {
                             overwrite = true;
+                        } else if arg == "--group" {
+                            group = Some(args.value(&arg)?);
                         } else if steps.is_none() {
                             steps = Some(arg);
                         } else {
@@ -418,7 +465,7 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                     let text = file_or_text(steps.ok_or_else(|| usage_error("Give the steps as JSON, @file.json or @-"))?)?;
                     let steps: Vec<workflow::Step> =
                         serde_json::from_str(&text).map_err(|e| usage_error(format!("The steps aren't valid: {e}")))?;
-                    print_json(&workflow::save(&name, steps, overwrite).map_err(error)?);
+                    print_json(&workflow::save(&name, steps, overwrite, group.as_deref()).map_err(error)?);
                 }
                 Some("run") => {
                     let name = args.value("workflow run")?;
@@ -441,6 +488,86 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                 Some(other) => return Err(usage_error(format!("Unexpected argument `{other}`"))),
             }
             Ok(EXIT_OK)
+        }
+        "audit" => {
+            use crate::store::log;
+            let history = crate::store::history::History::open().map_err(|e| error(e.to_string()))?;
+            let path = history.log_path().map(std::path::Path::to_path_buf).ok_or_else(|| error("This database has no audit log"))?;
+            match args.next().as_deref() {
+                Some("verify") => {
+                    args.finish()?;
+                    match log::verify(&path) {
+                        Ok((entries, head)) => {
+                            print_json(&serde_json::json!({ "ok": true, "entries": entries, "head": head, "log": path.display().to_string() }));
+                            Ok(EXIT_OK)
+                        }
+                        Err(broken) => {
+                            print_json(&serde_json::json!({ "ok": false, "broken_at": broken.seq, "reason": broken.reason, "log": path.display().to_string() }));
+                            Ok(EXIT_HTTP_ERROR)
+                        }
+                    }
+                }
+                Some("head") => {
+                    args.finish()?;
+                    match log::verify(&path) {
+                        Ok((entries, head)) => {
+                            print_json(&serde_json::json!({ "entries": entries, "head": head }));
+                            Ok(EXIT_OK)
+                        }
+                        Err(broken) => Err(error(format!("The log is broken at entry {}: {}", broken.seq, broken.reason))),
+                    }
+                }
+                Some("rebuild") => {
+                    args.finish()?;
+                    log::verify(&path).map_err(|b| error(format!("The log is broken at entry {} ({}), so nothing was rebuilt.", b.seq, b.reason)))?;
+                    let applied = history.rebuild_from_log().map_err(|e| error(e.to_string()))?;
+                    print_json(&serde_json::json!({ "rebuilt": true, "entries_applied": applied }));
+                    Ok(EXIT_OK)
+                }
+                Some("show") | None => {
+                    let (mut source, mut action, mut since, mut limit) = (None, None, None, 50usize);
+                    while let Some(arg) = args.next() {
+                        match arg.as_str() {
+                            "--source" => source = Some(args.value(&arg)?),
+                            "--action" => action = Some(args.value(&arg)?),
+                            "--since" => since = Some(args.value(&arg)?),
+                            "--limit" => limit = args.number(&arg)?,
+                            other => return Err(usage_error(format!("Unexpected argument `{other}`"))),
+                        }
+                    }
+                    let cutoff = match since {
+                        Some(text) => Some(since_cutoff(&text).ok_or_else(|| usage_error("--since is like 30m, 2h or 7d"))?),
+                        None => None,
+                    };
+                    let entries = log::read_from(&path, 0).map_err(|e| error(e.to_string()))?;
+                    let mut rows = Vec::new();
+                    for (entry, _) in entries {
+                        if source.as_deref().is_some_and(|s| entry.event.source() != Some(s)) {
+                            continue;
+                        }
+                        if action.as_deref().is_some_and(|a| entry.event.action() != a) {
+                            continue;
+                        }
+                        if let Some(cutoff) = cutoff {
+                            let when = time::OffsetDateTime::parse(&entry.time, &time::format_description::well_known::Rfc3339).ok();
+                            if when.is_some_and(|w| w < cutoff) {
+                                continue;
+                            }
+                        }
+                        rows.push(serde_json::json!({
+                            "seq": entry.seq,
+                            "time": entry.time,
+                            "action": entry.event.action(),
+                            "source": entry.event.source(),
+                            "what": entry.event.summary(),
+                        }));
+                    }
+                    let skip = rows.len().saturating_sub(limit);
+                    print_json(&serde_json::json!({ "entries": rows.into_iter().skip(skip).collect::<Vec<_>>() }));
+                    Ok(EXIT_OK)
+                }
+                Some(other) => Err(usage_error(format!("Unexpected argument `{other}`"))),
+            }
         }
         "history" => {
             if args.peek_is("show") {
@@ -534,6 +661,29 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
     }
 }
 
+/// Sends the request and writes the whole body to `file`: raw bytes for a binary body, the (masked) text
+/// otherwise. The result prints without the body and says where it went (`body_file`).
+fn send_to_file(params: &SendParams, file: &str) -> Result<crate::engine::AgentResponse, SendFailure> {
+    let mut params = params.clone();
+    // the body is going to a file, so the size limit for what is printed does not apply
+    params.max_body_chars = Some(20_000_000);
+    let (mut shaped, raw) = agent::send_request_full(&params, Source::Cli)?;
+    let bytes: Vec<u8> = match (&raw.binary, &shaped.json, &shaped.body) {
+        (Some(bytes), _, _) => bytes.clone(),
+        (_, Some(json), _) => serde_json::to_string_pretty(json).unwrap_or_default().into_bytes(),
+        (_, _, Some(text)) => text.clone().into_bytes(),
+        _ => Vec::new(),
+    };
+    std::fs::write(file, &bytes).map_err(|e| SendFailure::Failed(format!("Could not write {file}: {e}")))?;
+    shaped.json = None;
+    shaped.body = None;
+    shaped.outline = None;
+    shaped.hint = None;
+    shaped.body_cut_from_chars = None;
+    shaped.body_file = Some(file.to_string());
+    Ok(shaped)
+}
+
 fn finish_send(result: Result<crate::engine::AgentResponse, SendFailure>, fail: bool) -> Result<i32, Exit> {
     match result {
         Ok(response) => {
@@ -549,6 +699,8 @@ fn finish_send(result: Result<crate::engine::AgentResponse, SendFailure>, fail: 
 struct SendOptions {
     params: SendParams,
     fail: bool,
+    /// `--out FILE`: write the whole body to this file.
+    out: Option<String>,
 }
 
 impl SendOptions {
@@ -597,6 +749,8 @@ impl SendOptions {
             "--insecure" | "-k" => p.insecure_tls = Some(true),
             "--no-follow" => p.follow_redirects = Some(false),
             "--max-body" => p.max_body_chars = Some(args.number(arg)?),
+            "--include-headers" => p.include_headers = Some(args.value(arg)?),
+            "--out" => self.out = Some(args.value(arg)?),
             "--fail" => self.fail = true,
             _ => return Ok(false),
         }
@@ -686,6 +840,20 @@ pub fn attach_parent_console() {
 #[cfg(not(windows))]
 pub fn attach_parent_console() {}
 
+/// "30m", "2h" or "7d" as the time that long ago.
+fn since_cutoff(text: &str) -> Option<time::OffsetDateTime> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let n: i64 = number.parse().ok()?;
+    let seconds = match unit {
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return None,
+    };
+    Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +931,19 @@ mod tests {
         ] {
             let Err(e) = dispatch(args(&bad)) else { panic!("{bad:?} should fail") };
             assert_eq!((e.code, e.kind), (EXIT_USAGE, "usage"), "{bad:?}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn since_is_minutes_hours_or_days_ago() {
+        use super::since_cutoff;
+        let now = time::OffsetDateTime::now_utc();
+        let hour = since_cutoff("1h").unwrap();
+        assert!((3599..=3601).contains(&(now - hour).whole_seconds()));
+        assert!((29..=30).contains(&(now - since_cutoff("30m").unwrap()).whole_minutes()));
+        assert!((47..=48).contains(&(now - since_cutoff("2d").unwrap()).whole_hours()));
+        for bad in ["", "h", "1", "1w", "x1h"] {
+            assert!(since_cutoff(bad).is_none(), "{bad:?}");
         }
     }
 

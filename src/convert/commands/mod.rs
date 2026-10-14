@@ -1,12 +1,13 @@
 //! A request written out as, and read back from, a command someone can paste into a shell:
 //! curl for bash, curl for the Windows command prompt, and PowerShell; and written out as a
-//! JavaScript `fetch` call or an HTTPie `http` command. `{{variables}}` stay as placeholders
-//! when exporting, so an exported command never carries a secret.
+//! JavaScript `fetch` call. `{{variables}}` stay as placeholders when exporting, so an exported
+//! command never carries a secret.
 
 mod cmd;
 mod httpie;
 mod javascript;
 mod powershell;
+mod python;
 
 use crate::domain::model::{BodyMode, FieldKind, ParsedRequest, PersistedState};
 use crate::domain::request::parse_headers;
@@ -21,18 +22,26 @@ pub enum Dialect {
     /// Export only.
     JavaScriptFetch,
     /// Export only.
-    Httpie,
+    PythonRequests,
+    /// Export only (HTTPie 3 or later).
+    HttpieBash,
 }
 
 impl Dialect {
-    pub const ALL: [Dialect; 6] = [
+    pub const ALL: [Dialect; 7] = [
         Dialect::CurlBash,
         Dialect::CurlCmd,
         Dialect::PowerShellRest,
         Dialect::PowerShellWeb,
         Dialect::JavaScriptFetch,
-        Dialect::Httpie,
+        Dialect::PythonRequests,
+        Dialect::HttpieBash,
     ];
+
+    /// Written out, never read back.
+    pub fn export_only(self) -> bool {
+        matches!(self, Dialect::JavaScriptFetch | Dialect::PythonRequests | Dialect::HttpieBash)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -41,7 +50,8 @@ impl Dialect {
             Dialect::PowerShellRest => "PowerShell (Invoke-RestMethod)",
             Dialect::PowerShellWeb => "PowerShell (Invoke-WebRequest)",
             Dialect::JavaScriptFetch => "JavaScript (fetch)",
-            Dialect::Httpie => "HTTPie",
+            Dialect::PythonRequests => "Python (requests)",
+            Dialect::HttpieBash => "HTTPie",
         }
     }
 }
@@ -116,7 +126,8 @@ pub fn export(state: &PersistedState, dialect: Dialect) -> String {
         Dialect::PowerShellRest => powershell::export(&Parts::from_state(state), "Invoke-RestMethod"),
         Dialect::PowerShellWeb => powershell::export(&Parts::from_state(state), "Invoke-WebRequest"),
         Dialect::JavaScriptFetch => javascript::export(&Parts::from_state(state)),
-        Dialect::Httpie => httpie::export(&Parts::from_state(state)),
+        Dialect::PythonRequests => python::export(&Parts::from_state(state)),
+        Dialect::HttpieBash => httpie::export(&Parts::from_state(state)),
     }
 }
 
@@ -141,8 +152,8 @@ pub fn import(input: &str) -> Result<ParsedRequest, String> {
         Dialect::CurlCmd => crate::convert::curl_import::parse_curl(&cmd::normalize(input)),
         Dialect::PowerShellRest | Dialect::PowerShellWeb => powershell::parse(input),
         // `detect` never picks these: they are export only.
-        Dialect::JavaScriptFetch => Err("Plunger cannot import a JavaScript fetch call.".into()),
-        Dialect::Httpie => Err("Plunger cannot import an HTTPie command.".into()),
+        other if other.export_only() => Err(format!("Plunger can write {} but not read it.", other.label())),
+        other => Err(format!("{} is not a command Plunger reads.", other.label())),
     }
 }
 
@@ -194,8 +205,8 @@ mod tests {
 
     #[test]
     fn every_dialect_round_trips_through_its_own_importer() {
-        // JavaScript and HTTPie are export only
-        for dialect in Dialect::ALL.into_iter().filter(|d| *d != Dialect::JavaScriptFetch && *d != Dialect::Httpie) {
+        // JavaScript, Python and HTTPie are export only
+        for dialect in Dialect::ALL.into_iter().filter(|d| !d.export_only()) {
             for s in sample_states() {
                 let text = export(&s, dialect);
                 let back = import(&text).unwrap_or_else(|e| panic!("{dialect:?}: {e}\n{text}"));

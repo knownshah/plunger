@@ -168,6 +168,9 @@ pub struct WorkflowResult {
 pub struct WorkflowInfo {
     pub name: String,
     pub steps: Vec<Step>,
+    /// The group it is filed under (`Jira`, `Jira/Issues`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -215,16 +218,22 @@ fn valid_name(name: &str) -> Result<&str, String> {
 }
 
 /// Saves a workflow under `name`. An existing name is refused unless `overwrite` is set.
-pub fn save(name: &str, steps: Vec<Step>, overwrite: bool) -> Result<WorkflowInfo, String> {
+pub fn save(name: &str, steps: Vec<Step>, overwrite: bool, group: Option<&str>) -> Result<WorkflowInfo, String> {
     let name = valid_name(name)?.to_string();
     check(&steps)?;
+    let group = group.map(crate::store::history::normalize_group).transpose()?;
     let history = agent::open_history()?;
     if !overwrite && history.get_workflow(&name).map_err(|e| e.to_string())?.is_some() {
         return Err(format!("A workflow named '{name}' already exists. Pass `overwrite: true` to replace it."));
     }
     let json = serde_json::to_string(&steps).map_err(|e| e.to_string())?;
     history.save_workflow(&name, &json).map_err(|e| e.to_string())?;
-    Ok(WorkflowInfo { name, steps })
+    // None leaves a replaced workflow in its group, "" takes it out
+    if let Some(group) = &group {
+        history.set_workflow_group(&name, group.as_deref()).map_err(|e| e.to_string())?;
+    }
+    let group = history.workflow_groups().map_err(|e| e.to_string())?.remove(&name);
+    Ok(WorkflowInfo { name, steps, group })
 }
 
 pub(crate) fn parse_steps(json: &str) -> Result<Vec<Step>, String> {
@@ -237,14 +246,21 @@ pub fn get(name: &str) -> Result<WorkflowInfo, String> {
         .get_workflow(name.trim())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("No workflow named '{}'. See list_workflows.", name.trim()))?;
-    Ok(WorkflowInfo { name: name.trim().to_string(), steps: parse_steps(&json)? })
+    let group = history.workflow_groups().map_err(|e| e.to_string())?.remove(name.trim());
+    Ok(WorkflowInfo { name: name.trim().to_string(), steps: parse_steps(&json)?, group })
 }
 
-pub fn list() -> Result<WorkflowList, String> {
+/// The workflows, optionally only those in `group` (or under it).
+pub fn list(group: Option<&str>) -> Result<WorkflowList, String> {
     let history = agent::open_history()?;
+    let groups = history.workflow_groups().map_err(|e| e.to_string())?;
     let mut workflows = Vec::new();
     for (name, json) in history.list_workflows().map_err(|e| e.to_string())? {
-        workflows.push(WorkflowInfo { name, steps: parse_steps(&json)? });
+        let filed = groups.get(&name).cloned();
+        if group.is_some_and(|g| !crate::store::history::group_matches(filed.as_deref(), g)) {
+            continue;
+        }
+        workflows.push(WorkflowInfo { name, steps: parse_steps(&json)?, group: filed });
     }
     Ok(WorkflowList { workflows })
 }
@@ -564,6 +580,12 @@ mod tests {
             problems: Vec::new(),
             outline: None,
             hint: None,
+            ttfb_ms: None,
+            final_url: None,
+            redirects: Vec::new(),
+            sha256: None,
+            detected_type: None,
+            body_file: None,
         };
         (shaped, raw)
     }

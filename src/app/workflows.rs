@@ -15,6 +15,7 @@ pub(super) struct WorkflowItem {
     pub name: String,
     pub steps: Vec<Step>,
     pub last: Option<WorkflowRunRow>,
+    pub group: Option<String>,
 }
 
 /// The open workflow window.
@@ -72,7 +73,7 @@ fn parse_values(text: &str) -> BTreeMap<String, String> {
 }
 
 /// "POST {{base}}/login" or the saved request's name.
-fn step_title(step: &Step) -> (String, String) {
+pub(super) fn step_title(step: &Step) -> (String, String) {
     match (&step.request.saved_request, &step.request.url) {
         (Some(saved), None) => ("SAVED".to_string(), saved.clone()),
         (_, url) => (
@@ -88,10 +89,21 @@ pub(super) enum ListAction {
     Run(String),
     Copy(String),
     Delete(String),
+    /// File the workflow under a group (None takes it out of its group).
+    MoveToGroup(String, Option<String>),
+    /// Fold a group away or open it again.
+    ToggleGroup(String),
 }
 
 /// The sidebar section. Returns what was chosen on a row: a click opens it, the context menu has the rest.
-pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &mut bool, selected: Option<&str>) -> Option<ListAction> {
+pub(super) fn sidebar_section(
+    ui: &mut egui::Ui,
+    items: &[WorkflowItem],
+    open: &mut bool,
+    selected: Option<&str>,
+    collapsed: &std::collections::HashSet<String>,
+    group_input: &mut String,
+) -> Option<ListAction> {
     if items.is_empty() {
         return None;
     }
@@ -99,9 +111,27 @@ pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &
     super::sidebar::section_header(ui, "WORKFLOWS", items.len(), open, |_| {});
     let mut clicked = None;
     if *open {
+        let mut groups: Vec<String> = items.iter().filter_map(|i| i.group.clone()).collect();
+        groups.dedup();
+        let mut current: Option<&str> = None;
         for item in items {
+            // the list is ordered by group: a header where the group changes, nothing under a folded one
+            if item.group.as_deref() != current {
+                current = item.group.as_deref();
+                if let Some(path) = current {
+                    let count = items.iter().filter(|i| i.group.as_deref() == Some(path)).count();
+                    if super::sidebar::group_header(ui, path, count, collapsed.contains(path)) {
+                        clicked = Some(ListAction::ToggleGroup(path.to_string()));
+                    }
+                }
+            }
+            if item.group.as_deref().is_some_and(|g| super::sidebar::group_is_hidden(g, collapsed)) {
+                continue;
+            }
+            let indent = if item.group.is_some() { 12.0 } else { 0.0 };
             let p = palette();
             let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+            let rect = egui::Rect::from_min_max(rect.min + egui::vec2(indent, 0.0), rect.max);
             if !ui.is_rect_visible(rect) {
                 continue;
             }
@@ -153,6 +183,10 @@ pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &
                     clicked = Some(ListAction::Copy(item.name.clone()));
                     ui.close();
                 }
+                if let Some(chosen) = super::sidebar::move_to_group_menu(ui, &groups, item.group.as_deref(), group_input) {
+                    clicked = Some(ListAction::MoveToGroup(item.name.clone(), chosen));
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Delete\u{2026}").clicked() {
                     clicked = Some(ListAction::Delete(item.name.clone()));
@@ -170,15 +204,22 @@ impl ApiTesterApp {
         let Some(h) = &self.history else { return };
         let rows = h.list_workflows().unwrap_or_default();
         let latest = h.latest_workflow_runs().unwrap_or_default();
+        let groups = h.workflow_groups().unwrap_or_default();
         let runs = self.workflow_view.as_ref().map(|v| h.workflow_runs(&v.name, WORKFLOW_RUNS_KEPT).unwrap_or_default());
         self.workflows = rows
             .into_iter()
             .filter_map(|(name, json)| {
                 let steps = workflow::parse_steps(&json).ok()?;
                 let last = latest.iter().find(|r| r.workflow == name).cloned();
-                Some(WorkflowItem { name, steps, last })
+                let group = groups.get(&name).cloned();
+                Some(WorkflowItem { name, steps, last, group })
             })
             .collect();
+        // ungrouped first, then by group, then by name: the order the sidebar shows them in
+        self.workflows.sort_by(|a, b| {
+            let key = |w: &WorkflowItem| (w.group.clone().unwrap_or_default().to_lowercase(), w.name.to_lowercase());
+            key(a).cmp(&key(b))
+        });
         if let (Some(view), Some(runs)) = (&mut self.workflow_view, runs) {
             view.runs = runs;
         }
@@ -217,6 +258,17 @@ impl ApiTesterApp {
                 }
             }
             ListAction::Copy(name) => self.copy_workflow(ctx, &name),
+            ListAction::MoveToGroup(name, group) => {
+                if let Some(h) = &self.history {
+                    let _ = h.set_workflow_group(&name, group.as_deref());
+                }
+                self.refresh_workflows();
+            }
+            ListAction::ToggleGroup(path) => {
+                if !self.collapsed_groups.remove(&path) {
+                    self.collapsed_groups.insert(path);
+                }
+            }
             ListAction::Delete(name) => self.workflow_delete = Some(name),
         }
     }
@@ -453,72 +505,20 @@ impl ApiTesterApp {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.label(egui::RichText::new("STEPS").small().strong().color(ui.visuals().weak_text_color()));
-                egui::ScrollArea::vertical().id_salt("workflow-steps").max_height(250.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, step) in steps.iter().enumerate() {
-                        let (method, target) = step_title(step);
-                        ui.horizontal(|ui| {
-                            // a dot for the live state of this step while it runs
-                            match live.as_ref().and_then(|l| l.get(i)) {
-                                Some((Some(done), _)) => dot(ui, if done.ok { palette().ok } else { palette().error }, true),
-                                Some((None, true)) => {
-                                    ui.add(egui::Spinner::new().size(10.0));
-                                }
-                                Some((None, false)) => dot(ui, ui.visuals().weak_text_color(), false),
-                                None => {}
-                            }
-                            ui.label(egui::RichText::new(format!("{}", i + 1)).weak());
-                            let label = step.label.clone().unwrap_or_default();
-                            if !label.is_empty() {
-                                ui.label(egui::RichText::new(label).strong());
-                            }
-                            ui.label(egui::RichText::new(method).monospace().color(palette().accent_text));
-                            ui.add(egui::Label::new(egui::RichText::new(target).monospace()).truncate());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("Open as request").on_hover_text("Open this step in a tab, to try it by hand").clicked() {
-                                    open_step = Some(i);
-                                }
-                            });
-                        });
-                        let mut notes: Vec<String> = Vec::new();
-                        if let Some(headers) = &step.request.headers {
-                            if !headers.is_empty() {
-                                notes.push(format!("headers: {}", headers.keys().cloned().collect::<Vec<_>>().join(", ")));
-                            }
-                        }
-                        if step.request.json.is_some() || step.request.body.is_some() || step.request.form.is_some() {
-                            notes.push("with a body".to_string());
-                        }
-                        for e in &step.request.extract {
-                            notes.push(format!("keeps {} from {}{}", e.name, e.from, if e.secret == Some(true) { " (secret)" } else { "" }));
-                        }
-                        if let Some(want) = &step.expect_status {
-                            notes.push(format!("expects {}", want.describe()));
-                        }
-                        if let Some(condition) = &step.skip_if {
-                            notes.push(format!("skipped if {condition}"));
-                        }
-                        if let Some(condition) = &step.stop_if {
-                            notes.push(format!("stops the run if {condition}"));
-                        }
-                        if !notes.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(22.0);
-                                ui.add(egui::Label::new(egui::RichText::new(notes.join("  \u{b7}  ")).weak().small()).wrap());
-                            });
-                        }
-                        // the result of this step in the run in progress
-                        if let Some((Some(done), _)) = live.as_ref().and_then(|l| l.get(i)) {
-                            if let Some(error) = &done.error {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(22.0);
-                                    ui.colored_label(palette().error, error);
-                                });
-                            }
-                        }
-                        ui.add_space(4.0);
-                    }
+                // the steps as a flow: the dots show the run in progress, or else the one chosen below
+                let shown_run = view.selected.and_then(|id| view.runs.iter().find(|r| r.id == id)).or_else(|| view.runs.first());
+                let stored_steps: Vec<StoredStep> = shown_run.map(|r| serde_json::from_str(&r.steps).unwrap_or_default()).unwrap_or_default();
+                let states: Vec<super::workflow_flow::NodeState> = (0..steps.len())
+                    .map(|i| match live.as_ref().and_then(|l| l.get(i)) {
+                        Some((Some(done), _)) => super::workflow_flow::NodeState::from_stored(done),
+                        Some((None, true)) => super::workflow_flow::NodeState::Running,
+                        Some((None, false)) => super::workflow_flow::NodeState::Idle,
+                        None => stored_steps.get(i).map_or(super::workflow_flow::NodeState::Idle, super::workflow_flow::NodeState::from_stored),
+                    })
+                    .collect();
+                egui::ScrollArea::vertical().id_salt("workflow-steps").max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    super::workflow_flow::render(ui, &steps, &states, &mut open_step);
                 });
-
                 ui.add_space(4.0);
                 ui.separator();
                 ui.label(egui::RichText::new("LAST RUN").small().strong().color(ui.visuals().weak_text_color()));
