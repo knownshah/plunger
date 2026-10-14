@@ -40,7 +40,7 @@ impl ApiTesterApp {
             .collect()
     }
 
-    /// Removes a variable an agent set (the Variables tab's trash icon).
+    /// Removes a variable an agent set (the Variables window's trash icon).
     pub(super) fn delete_agent_variable(&mut self, name: &str) {
         if let Some(h) = &self.history {
             let _ = h.delete_agent_variable(name);

@@ -16,6 +16,7 @@ mod response_search;
 mod sidebar;
 mod tab;
 mod tabs;
+mod variables_window;
 mod workflows;
 
 pub use tab::SavedTab;
@@ -144,6 +145,8 @@ pub struct ApiTesterApp {
     workflow_run: Option<workflows::WorkflowRun>,
     /// A workflow waiting for the person to confirm its deletion.
     workflow_delete: Option<String>,
+    /// The Variables window (Tools > Variables): variables belong to the session, not to one request.
+    variables_open: bool,
     /// Help > Keyboard shortcuts and Help > About are open.
     shortcuts_open: bool,
     about_open: bool,
@@ -192,6 +195,7 @@ impl ApiTesterApp {
             workflow_view: None,
             workflow_run: None,
             workflow_delete: None,
+            variables_open: false,
             shortcuts_open: false,
             about_open: false,
             export_dialect: Dialect::CurlBash,
@@ -242,6 +246,27 @@ impl ApiTesterApp {
         let tab = &mut self.tabs[self.active];
         let problems = self.secret_sync.restore(&*self.secrets, &mut tab.state, &mut self.bearer_token);
         self.secrets_error = problems.into_iter().next();
+        self.migrate_saved_bearer();
+    }
+
+    /// The Auth tab is gone: Authorization is a header. A Bearer token a person had saved becomes a secret
+    /// variable named `bearer`, to use as `Authorization: Bearer {{bearer}}`, and is no longer added to every
+    /// request behind their back.
+    fn migrate_saved_bearer(&mut self) {
+        if self.bearer_token.trim().is_empty() {
+            return;
+        }
+        let state = &mut self.tabs[self.active].state;
+        if state.variables.iter().any(|v| v.name.trim() == "bearer") {
+            return;
+        }
+        state.variables.push(crate::domain::model::Variable {
+            name: "bearer".to_string(),
+            value: self.bearer_token.trim().to_string(),
+            secret: true,
+            remember: true,
+        });
+        self.notify("The Auth tab is gone: your saved token is now the variable {{bearer}}. Send it as \"Authorization: Bearer {{bearer}}\" in Headers.");
     }
 
     /// Called from `save`: writes ticked secrets to the OS store, deletes unticked ones.
@@ -260,9 +285,9 @@ impl ApiTesterApp {
     // ---- sending ----------------------------------------------------------
 
     fn trigger_send(&mut self, ctx: &egui::Context) {
-        let bearer = self.bearer_token.clone();
         let agent_variables = self.agent_variable_values();
-        self.tab_mut().send(&bearer, &agent_variables);
+        // Authorization is whatever the Headers say; nothing is added behind the request's back
+        self.tab_mut().send("", &agent_variables);
         ctx.request_repaint();
     }
 
@@ -406,11 +431,13 @@ impl ApiTesterApp {
         self.render_help_windows(ctx);
         self.render_workflow_window(ctx);
         self.render_workflow_delete_dialog(ctx);
+        self.render_variables_window(ctx);
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.render_tab_bar(ui);
             ui.add_space(4.0);
             self.render_command_bar(ui);
+            self.render_uses_line(ui);
             self.tab_mut().sync_params_from_url();
             ui.add_space(6.0);
             self.render_request_section(ui);

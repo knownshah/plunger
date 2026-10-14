@@ -348,45 +348,7 @@ impl From<&HistoryEntry> for StoredRequestInfo {
     }
 }
 
-/// `{{names}}` referenced anywhere in the request, in order of first use. The built-ins that fill
-/// themselves in (`$uuid`, ...) are left out; an environment variable is listed as `$env:NAME`
-/// because it must be set when the request is sent.
-pub fn variables_used(state: &PersistedState) -> Vec<String> {
-    let mut texts = vec![state.url.as_str(), state.headers_text.as_str()];
-    match state.body_mode {
-        BodyMode::Json => texts.push(&state.json_body),
-        BodyMode::Raw => texts.push(&state.raw_body),
-        BodyMode::UrlEncoded => texts.push(&state.urlencoded_body),
-        BodyMode::Multipart | BodyMode::None => {}
-    }
-    let mut names: Vec<String> = Vec::new();
-    for field in &state.multipart_fields {
-        collect_names(&field.value, &mut names);
-    }
-    for text in texts {
-        collect_names(text, &mut names);
-    }
-    names
-}
-
-fn collect_names(text: &str, names: &mut Vec<String>) {
-    let mut rest = text;
-    while let Some(start) = rest.find("{{") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else { return };
-        let name = crate::domain::vars::parse_placeholder(&after[..end]).name;
-        let is_env = name.strip_prefix("$env:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-        let valid = is_env
-            || (!name.is_empty()
-                && !name.starts_with('$')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'));
-        if valid && !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
-        }
-        rest = &after[end + 2..];
-    }
-}
-
+pub use crate::domain::vars::variables_used;
 
 #[cfg(test)]
 mod tests {

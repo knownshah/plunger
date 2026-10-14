@@ -190,15 +190,15 @@ fn every_request_tab_draws_and_keeps_one_spare_row() {
     let mut a = app(busy_state());
     for tab in [
         RequestTab::Params,
-        RequestTab::Auth,
         RequestTab::Headers,
         RequestTab::Body,
-        RequestTab::Variables,
         RequestTab::Options,
     ] {
         a.tab_mut().request_tab = tab;
         draw(&mut a);
     }
+    a.variables_open = true; // the variables have a window now
+    draw(&mut a);
     assert!(a.tab_mut().state.params.last().unwrap().is_blank());
     assert_eq!(a.tab_mut().state.params.iter().filter(|p| p.is_blank()).count(), 1);
     assert!(a.tab_mut().state.variables.last().unwrap().is_blank());
@@ -237,7 +237,7 @@ fn every_pane_layout_draws_with_and_without_a_response() {
     use crate::app::tab::Pane;
     let mut a = app(busy_state());
     for pane in [Pane::Both, Pane::RequestExpanded, Pane::ResponseExpanded] {
-        for request_tab in [RequestTab::Params, RequestTab::Headers, RequestTab::Body, RequestTab::Variables] {
+        for request_tab in [RequestTab::Params, RequestTab::Headers, RequestTab::Body] {
             a.tab_mut().pane = pane;
             a.tab_mut().request_tab = request_tab;
             a.tab_mut().outcome = Outcome::Empty;
@@ -322,8 +322,8 @@ fn request_menu_entries_open_their_tab_and_bring_back_a_folded_editor() {
     let mut a = app(PersistedState::default());
     let ctx = egui::Context::default();
     a.tab_mut().pane = Pane::ResponseExpanded;
-    a.run_action(&ctx, Action::ShowAuth);
-    assert!(a.tab().request_tab == RequestTab::Auth);
+    a.run_action(&ctx, Action::ShowHeaders);
+    assert!(a.tab().request_tab == RequestTab::Headers);
     assert_eq!(a.tab().pane, Pane::Both);
     a.run_action(&ctx, Action::ExpandRequest);
     assert_eq!(a.tab().pane, Pane::RequestExpanded);
@@ -592,7 +592,8 @@ fn an_unreadable_store_shows_an_error_keeps_the_data_and_the_ui_still_draws() {
     a.restore_secrets();
     assert!(a.secrets_error.as_deref().is_some_and(|e| e.contains("locked")));
 
-    for tab in [RequestTab::Auth, RequestTab::Headers, RequestTab::Variables] {
+    a.variables_open = true;
+    for tab in [RequestTab::Params, RequestTab::Headers] {
         a.tab_mut().request_tab = tab;
         draw(&mut a);
     }

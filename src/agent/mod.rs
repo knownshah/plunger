@@ -314,7 +314,7 @@ fn send_prepared_raw(
             Ok((shaped, sent.response))
         }
         Err(SendError::Refused(msg)) => {
-            // The window's advice ("define it in the Variables tab") isn't
+            // The window's advice ("define it in Tools > Variables") isn't
             // something an agent can do; say how it can supply one instead.
             let hint = if msg.starts_with("Undefined variable") {
                 " An agent can pass a value for this request: `variables` in MCP, `--var name=value` on the command line."

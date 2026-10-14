@@ -1,4 +1,4 @@
-//! The Params and Variables tabs: both are plain lists of name/value rows.
+//! The Params tab and the Variables window: both are plain lists of name/value rows.
 
 use super::rows::{edit_rows, enabled_checkbox, remove_button};
 use super::suggest::variable_chips;

@@ -39,16 +39,15 @@ pub(super) enum Action {
     NextTab,
     PreviousTab,
     ShowParams,
-    ShowAuth,
     ShowHeaders,
     ShowBody,
-    ShowVariables,
     ShowOptions,
     ExpandRequest,
     ExpandResponse,
     RestoreLayout,
     // Tools
     ShowWorkflows,
+    ShowVariables,
     SetUpAgents,
     // Help
     KeyboardShortcuts,
@@ -96,10 +95,8 @@ pub(super) const REQUEST_MENU: &[Option<Action>] = &[
     Some(Action::RunWorkflow),
     None,
     Some(Action::ShowParams),
-    Some(Action::ShowAuth),
     Some(Action::ShowHeaders),
     Some(Action::ShowBody),
-    Some(Action::ShowVariables),
     Some(Action::ShowOptions),
     None,
     Some(Action::ExpandRequest),
@@ -110,7 +107,7 @@ pub(super) const REQUEST_MENU: &[Option<Action>] = &[
     Some(Action::NextTab),
     Some(Action::PreviousTab),
 ];
-pub(super) const TOOLS_MENU: &[Option<Action>] = &[Some(Action::ShowWorkflows), Some(Action::SetUpAgents)];
+pub(super) const TOOLS_MENU: &[Option<Action>] = &[Some(Action::ShowWorkflows), Some(Action::ShowVariables), Some(Action::SetUpAgents)];
 pub(super) const HELP_MENU: &[Option<Action>] = &[
     Some(Action::KeyboardShortcuts),
     Some(Action::Documentation),
@@ -165,7 +162,6 @@ impl Action {
             Action::NextTab => "Next tab",
             Action::PreviousTab => "Previous tab",
             Action::ShowParams => "Params",
-            Action::ShowAuth => "Auth",
             Action::ShowHeaders => "Headers",
             Action::ShowBody => "Body",
             Action::ShowVariables => "Variables",
@@ -200,11 +196,9 @@ impl Action {
             Action::RunWorkflow => (cmd | Modifiers::SHIFT, Key::R),
             Action::Cancel => (Modifiers::NONE, Key::Escape),
             Action::ShowParams => (cmd, Key::Num1),
-            Action::ShowAuth => (cmd, Key::Num2),
-            Action::ShowHeaders => (cmd, Key::Num3),
-            Action::ShowBody => (cmd, Key::Num4),
-            Action::ShowVariables => (cmd, Key::Num5),
-            Action::ShowOptions => (cmd, Key::Num6),
+            Action::ShowHeaders => (cmd, Key::Num2),
+            Action::ShowBody => (cmd, Key::Num3),
+            Action::ShowOptions => (cmd, Key::Num4),
             Action::NextTab => (cmd, Key::Tab),
             Action::PreviousTab => (cmd | Modifiers::SHIFT, Key::Tab),
             Action::KeyboardShortcuts => (Modifiers::NONE, Key::F1),
@@ -318,10 +312,9 @@ impl ApiTesterApp {
                 self.activate(previous);
             }
             Action::ShowParams => self.show_request_tab(RequestTab::Params),
-            Action::ShowAuth => self.show_request_tab(RequestTab::Auth),
             Action::ShowHeaders => self.show_request_tab(RequestTab::Headers),
             Action::ShowBody => self.show_request_tab(RequestTab::Body),
-            Action::ShowVariables => self.show_request_tab(RequestTab::Variables),
+            Action::ShowVariables => self.variables_open = true,
             Action::ShowOptions => self.show_request_tab(RequestTab::Options),
             Action::ExpandRequest => self.tab_mut().pane = tab::Pane::RequestExpanded,
             Action::ExpandResponse => self.tab_mut().pane = tab::Pane::ResponseExpanded,
@@ -511,7 +504,7 @@ mod tests {
     #[test]
     fn the_shortcuts_people_know_are_there() {
         let has = |a: Action| a.shortcut().is_some();
-        for action in [Action::NewTab, Action::SaveRequest, Action::CloseTab, Action::Send, Action::Cancel, Action::GoToUrl, Action::FindInResponse, Action::NextTab, Action::PreviousTab, Action::CopyAsLast, Action::ZoomIn, Action::ZoomOut, Action::ZoomReset, Action::ToggleSidebar, Action::KeyboardShortcuts, Action::ShowParams, Action::ShowBody, Action::ShowVariables] {
+        for action in [Action::NewTab, Action::SaveRequest, Action::CloseTab, Action::Send, Action::Cancel, Action::GoToUrl, Action::FindInResponse, Action::NextTab, Action::PreviousTab, Action::CopyAsLast, Action::ZoomIn, Action::ZoomOut, Action::ZoomReset, Action::ToggleSidebar, Action::KeyboardShortcuts, Action::ShowParams, Action::ShowBody] {
             assert!(has(action), "{action:?} lost its shortcut");
         }
     }

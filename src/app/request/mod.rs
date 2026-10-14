@@ -1,6 +1,5 @@
-//! The request editor tabs: Params, Auth, Headers, Body, Variables, Options.
+//! The request editor tabs: Params, Headers, Body, Options.
 
-mod auth;
 mod body;
 mod headers;
 mod options;
@@ -31,14 +30,14 @@ fn request_tab_pill(ui: &mut egui::Ui, current: &mut RequestTab, value: RequestT
 }
 
 impl ApiTesterApp {
-    /// The Params / Auth / Headers / Body / Variables / Options strip and the selected panel. The
+    /// The Params / Headers / Body / Options strip and the selected panel. The
     /// panel grows with what is in it, up to the room there is (the response keeps a minimum), and is
     /// folded away when a request is sent so the response gets the room. Clicking a tab brings it back.
     pub(in crate::app) fn render_request_section(&mut self, ui: &mut egui::Ui) {
         let tab = &mut self.tabs[self.active];
         let mut clicked_tab = false;
         ui.horizontal(|ui| {
-            let labels = tab_labels(&tab.state, !self.bearer_token.is_empty(), self.agent_variables.len());
+            let labels = tab_labels(&tab.state);
             let current = &mut tab.request_tab;
             clicked_tab |= request_tab_pill(
                 ui,
@@ -50,22 +49,11 @@ impl ApiTesterApp {
             clicked_tab |= request_tab_pill(
                 ui,
                 current,
-                RequestTab::Auth,
-                &labels.auth,
-                "A Bearer token, sent as Authorization: Bearer <token> on every request from every tab.",
+                RequestTab::Headers,
+                &labels.headers,
+                "Request headers, including Authorization (for example Bearer {{token}}). {{variables}} work in the values.",
             );
-            clicked_tab |= request_tab_pill(ui, current, RequestTab::Headers, &labels.headers, "Request headers. {{variables}} work in the values.");
             clicked_tab |= request_tab_pill(ui, current, RequestTab::Body, &labels.body, "The request body: JSON, form-data, url-encoded or raw text.");
-            clicked_tab |= request_tab_pill(
-                ui,
-                current,
-                RequestTab::Variables,
-                &labels.variables,
-                "Use {{name}} in the URL, params, headers, body, form fields or the Bearer token.\n\
-                 Built-ins: {{$uuid}}, {{$timestamp}}, {{$randomInt}} and {{$env:NAME}} (an environment variable).\n\n\
-                 Secret values (lock on, or a name like token, secret, password or key) are never written to a file. \
-                 Turn on the key to keep one in the system credential store; otherwise it is blank after a restart.",
-            );
             let options_label = if tab.state.insecure_tls { "Options (TLS check off)" } else { "Options" };
             clicked_tab |= ui.selectable_value(&mut tab.request_tab, RequestTab::Options, options_label).clicked();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -98,8 +86,6 @@ impl ApiTesterApp {
             return;
         }
         ui.add_space(2.0);
-        let mut forget = false;
-        let mut delete_agent = None;
         let available = ui.available_height();
         let (height, fill) = match (tab.pane, tab.request_height) {
             // Leave room for the line that says the response is folded away.
@@ -120,22 +106,12 @@ impl ApiTesterApp {
             .show(ui, |ui| {
                 compact_card(ui, |ui| match tab.request_tab {
                     RequestTab::Params => tab.render_params_tab(ui),
-                    RequestTab::Variables => {
-                        forget = tab.render_variables_tab(ui, self.secrets_error.as_deref(), &self.agent_variables, &mut delete_agent)
-                    }
-                    RequestTab::Auth => tab.render_auth_tab(ui, &mut self.bearer_token, self.secrets_error.as_deref()),
                     RequestTab::Headers => tab.render_headers_tab(ui),
                     RequestTab::Body => tab.render_body_tab(ui),
                     RequestTab::Options => tab.render_options_tab(ui),
                 });
             });
         tab.request_shown_height = shown.inner_rect.height();
-        if forget {
-            self.forget_secrets();
-        }
-        if let Some(name) = delete_agent {
-            self.delete_agent_variable(&name);
-        }
     }
 }
 
@@ -143,13 +119,11 @@ impl ApiTesterApp {
 /// else (a body, a token), so what is set is visible without opening each tab.
 struct TabLabels {
     params: String,
-    auth: String,
     headers: String,
     body: String,
-    variables: String,
 }
 
-fn tab_labels(state: &PersistedState, has_bearer: bool, agent_variables: usize) -> TabLabels {
+fn tab_labels(state: &PersistedState) -> TabLabels {
     let count = |label: &str, n: usize| if n > 0 { format!("{label} ({n})") } else { label.to_string() };
     let marked = |label: &str, on: bool| if on { format!("{label} •") } else { label.to_string() };
     let has_body = match state.body_mode {
@@ -161,10 +135,8 @@ fn tab_labels(state: &PersistedState, has_bearer: bool, agent_variables: usize) 
     };
     TabLabels {
         params: count("Params", state.params.iter().filter(|p| p.enabled && !p.key.is_empty()).count()),
-        auth: marked("Auth", has_bearer),
         headers: count("Headers", parse_headers(&state.headers_text).iter().filter(|(k, _)| !k.trim().is_empty()).count()),
         body: marked("Body", has_body),
-        variables: count("Variables", state.variables.iter().filter(|v| !v.name.is_empty()).count() + agent_variables),
     }
 }
 
@@ -174,11 +146,8 @@ mod tests {
 
     #[test]
     fn empty_tabs_have_plain_titles_and_filled_ones_show_what_they_hold() {
-        let empty = tab_labels(&PersistedState::default(), false, 0);
-        assert_eq!(
-            [&empty.params, &empty.auth, &empty.headers, &empty.body, &empty.variables],
-            ["Params", "Auth", "Headers", "Body", "Variables"]
-        );
+        let empty = tab_labels(&PersistedState::default());
+        assert_eq!([&empty.params, &empty.headers, &empty.body], ["Params", "Headers", "Body"]);
 
         let state = PersistedState {
             headers_text: "Accept: */*\nContent-Type: application/json\n".into(),
@@ -186,13 +155,11 @@ mod tests {
             json_body: "{}".into(),
             ..Default::default()
         };
-        let labels = tab_labels(&state, true, 0);
+        let labels = tab_labels(&state);
         assert_eq!(labels.headers, "Headers (2)");
         assert_eq!(labels.body, "Body •");
-        assert_eq!(labels.auth, "Auth •");
 
         let blank_body = PersistedState { body_mode: BodyMode::Json, json_body: "  ".into(), ..Default::default() };
-        assert_eq!(tab_labels(&blank_body, false, 0).body, "Body");
-        assert_eq!(tab_labels(&PersistedState::default(), false, 3).variables, "Variables (3)", "variables agents set count too");
+        assert_eq!(tab_labels(&blank_body).body, "Body");
     }
 }

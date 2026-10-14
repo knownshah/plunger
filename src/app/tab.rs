@@ -101,6 +101,8 @@ pub(super) struct Tab {
     /// Set when this tab was opened from a history row: when it was sent and how it went (the
     /// response itself is not stored).
     pub opened_from: Option<HistoryMeta>,
+    /// The values this request's placeholders had when it was sent (a tab opened from the history).
+    pub sent_values: std::collections::BTreeMap<String, String>,
 }
 
 /// What the history knows about a request that was sent earlier.
@@ -142,6 +144,7 @@ impl Tab {
             editor_rows: 8,
             editor_fill: false,
             opened_from: None,
+            sent_values: Default::default(),
         }
     }
 
@@ -156,6 +159,7 @@ impl Tab {
         tab.name = entry.name.clone();
         tab.saved_id = entry.name.as_ref().map(|_| entry.id);
         tab.history_id = Some(entry.id);
+        tab.sent_values = entry.sent_values.clone();
         tab.opened_from = Some(HistoryMeta {
             created_at: entry.created_at.clone(),
             status: entry.status,
@@ -356,6 +360,7 @@ mod tests {
             elapsed_ms: Some(12),
             source: crate::store::history::Source::Cli,
             options: Default::default(),
+            sent_values: Default::default(),
         };
         let tab = Tab::from_entry(1, &entry, &PersistedState::default());
         let meta = tab.opened_from.expect("opened from history");

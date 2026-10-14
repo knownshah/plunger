@@ -125,7 +125,7 @@ A few promises, so you know what you're picking up:
     <td width="50%"><img src="docs/images/form-data.png" alt="A multipart form-data request with a text field and a file field, and the server's echo of the upload"><br><sub>Multipart uploads with real files.</sub></td>
   </tr>
   <tr>
-    <td><img src="docs/images/variables.png" alt="The Variables tab with a base URL and a masked secret token, used as {{base}} in the URL"><br><sub>Variables, with secrets masked and kept off disk.</sub></td>
+    <td><img src="docs/images/variables.png" alt="The Variables window with a base URL and a masked secret token, used as {{base}} in the URL"><br><sub>Variables, with secrets masked and kept off disk.</sub></td>
     <td><img src="docs/images/undefined-variables.png" alt="A request refused because {{base}} and {{token}} are not defined"><br><sub>Undefined variables stop the request instead of leaking a placeholder.</sub></td>
   </tr>
   <tr>

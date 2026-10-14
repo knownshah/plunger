@@ -17,7 +17,7 @@ If yes, it probably belongs. Things that don't: accounts, cloud sync, collaborat
 
 - **Report a bug** with the [bug template](https://github.com/metamug/plunger/issues/new?template=bug_report.yml). The most useful reports say what you sent (with secrets removed), what you expected, and what happened.
 - **Suggest an improvement** with the [feature template](https://github.com/metamug/plunger/issues/new?template=feature_request.yml).
-- **Fix an issue.** Look for the `good first issue` label.
+- **Fix an issue.** Start with [good first issue](https://github.com/metamug/plunger/issues?q=is%3Aopen+label%3A%22good+first+issue%22) (an hour or two) or [ready](https://github.com/metamug/plunger/issues?q=is%3Aopen+label%3Aready) (fully specified, any size): comment "I'll take this" so two people don't do the same one. Labels: `area:` says where the code is, `size:` how long it takes, `needs design` means talk first, `blocked` names the issue it waits for. Open issues are grouped in the [Next milestone](https://github.com/metamug/plunger/milestones) and the epics (#149 to #153, #195).
 - **Try it on your setup** (Windows 10/11 is the supported platform) and tell us what's rough.
 - **Improve the docs**, including [docs/agents.md](docs/agents.md).
 
@@ -31,11 +31,13 @@ rustup default stable-x86_64-pc-windows-gnu
 # plus mingw-w64 (gcc, windres, dlltool) on PATH, e.g. from WinLibs or MSYS2
 
 cargo build --release        # target/release/plunger.exe
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run `cargo test` and `cargo clippy` before you send a pull request; CI runs the same checks with warnings as errors.
+On macOS and Linux a stock Rust toolchain is enough (`cargo build --release`); the window on Linux needs a desktop session, the command line and MCP server do not. The repository is a Cargo workspace (`crates/mcp-install` is its own crate).
+
+Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` before you send a pull request; CI runs the same checks with warnings as errors, on Windows, Linux and macOS. `python3 scripts/agent-scenario.py target/release/plunger` drives the built program like an agent does against a fake issue tracker (`scripts/tracker-api.py`); run it if you change sending, variables, `select` or workflows.
 
 To try your build without touching your own history and settings, point it at a scratch folder:
 
@@ -48,14 +50,19 @@ PLUNGER_DATA_DIR=/path/to/scratch cargo run
 [design.md](design.md) explains the architecture and the reasons behind it. The short version:
 
 - `src/app/` is the window (egui). It holds no request logic.
-- `domain/request.rs`, `domain/vars.rs`, `domain/http.rs`, `domain/model.rs` and friends are the **core**: they know nothing about the window or agents.
-- `engine.rs`, `agent.rs`, `headless/cli.rs` and `headless/mcp.rs` are the agent interface. They use the same core as the window, so a rule like "an undefined `{{variable}}` is never sent" holds in every mode. Keep it that way: a behaviour change to sending belongs in the core, not in one front end.
+- `src/domain/` is the **core**: the request form (`model`), building and sending it (`request`, `http`), `{{variables}}` (`vars`), the query string, redaction and outlines. It knows nothing about the window or agents.
+- `src/store/` is the SQLite history (requests, saved requests, workflows and their runs) and the opt-in secret store.
+- `src/convert/` is curl, cmd, PowerShell, JavaScript and HAR in and out.
+- `src/engine/`, `src/agent/` and `src/workflow/` are what an agent gets: sending with secrets masked, the tool logic, ordered steps. `src/headless/` is the CLI, `plunger curl`, the MCP server and `plunger install`. They use the same core as the window, so a rule like "an undefined `{{variable}}` is never sent" holds in every mode. Keep it that way: a behaviour change to sending belongs in the core, not in one front end.
+- `src/ui/` is drawing helpers shared by the window: theme, icons, highlighting, the JSON tree.
+
+[docs/architecture.md](docs/architecture.md) has the same map as a table, and says where to look for each kind of change.
 
 ## Sending a pull request
 
 1. Fork, and branch from `main`.
 2. Keep the change focused: one fix or feature per pull request, without unrelated cleanup.
-3. Add a test for new behaviour and for a fixed bug. HTTP behaviour can be tested against the in-process server in `src/test_server.rs`.
+3. Add a test for new behaviour and for a fixed bug. HTTP behaviour can be tested against the in-process server in `src/test_server.rs`; a value that goes into a request is tested with awkward text (line breaks, quotes, `{{`) in every place it can land.
 4. Make sure `cargo test` and `cargo clippy --all-targets -- -D warnings` pass.
 5. If it changes what users see or do, update the README or `docs/`, and add a line under **Unreleased** in [CHANGELOG.md](CHANGELOG.md).
 6. In the description, say what changed and why, and how you tested it. For UI changes, a screenshot helps.
@@ -65,7 +72,7 @@ By contributing, you agree that your contribution is licensed under the [MIT lic
 ### Guidelines that keep it healthy
 
 - **Secrets are the sharp edge.** Anything that reads, stores, logs or returns a credential needs extra care and a test. Credentials must never reach disk, history or agent output unless the user opted in to storing them.
-- **No new network calls** except the requests the user (or their agent) sends. No analytics, no update checks.
+- **No new network calls** except the requests the user (or their agent) sends. No analytics. An update check (#144, #145) would be opt-in and off by default.
 - **Keep it small.** A new dependency needs a good reason; the size of the exe is a feature.
 - **Match the code around you.** Comments explain *why*, not what. Prefer a small function that's reused over a copy.
 

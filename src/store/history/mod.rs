@@ -3,6 +3,7 @@ use crate::domain::redact::{redact_headers_text, redact_url};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 mod variables;
@@ -76,6 +77,9 @@ pub struct HistoryEntry {
     pub elapsed_ms: Option<i64>,
     pub source: Source,
     pub options: SavedOptions,
+    /// For a request that was sent: the value each non-secret `{{placeholder}}` had when it went out
+    /// (secrets are not kept, and long values are cut).
+    pub sent_values: BTreeMap<String, String>,
 }
 
 /// Settings a saved request carries besides its form: how long to wait, whether to follow redirects,
@@ -114,6 +118,23 @@ impl SavedOptions {
     }
 }
 
+/// The values the non-secret placeholders of `state` have, each cut at a few hundred characters.
+/// Secrets, environment variables and the built-ins are not recorded.
+fn sent_values(state: &PersistedState) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in crate::domain::vars::variables_used(state) {
+        if name.starts_with("$env:") {
+            continue;
+        }
+        let Some(v) = state.variables.iter().find(|v| v.name.trim() == name) else { continue };
+        if v.is_secret() {
+            continue;
+        }
+        out.insert(name, v.value.chars().take(300).collect());
+    }
+    out
+}
+
 /// Rows that don't fit the fixed columns, stored as one JSON blob so new
 /// request features don't each need a schema change.
 #[derive(Serialize, Deserialize, Default)]
@@ -123,6 +144,9 @@ struct Extra {
     multipart: Vec<FormField>,
     #[serde(skip_serializing_if = "SavedOptions::is_empty")]
     options: SavedOptions,
+    /// For a request that was sent: the value each non-secret `{{placeholder}}` had.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    sent: BTreeMap<String, String>,
 }
 
 /// `?1` is a LIKE pattern from `like_pattern`.
@@ -205,6 +229,7 @@ impl From<&PersistedState> for StoredRequest {
             params: safe.params,
             multipart: safe.multipart_fields,
             options: SavedOptions::default(),
+            sent: BTreeMap::new(),
         })
         .unwrap_or_default();
         Self {
@@ -413,7 +438,17 @@ impl History {
         let created_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
-        let row = StoredRequest::from(state);
+        let mut row = StoredRequest::from(state);
+        if name.is_none() {
+            // a sent request remembers what its placeholders stood for, so a parameterised one can be
+            // compared with what actually went out
+            let sent = sent_values(state);
+            if !sent.is_empty() {
+                let mut extra: Extra = serde_json::from_str(&row.extra).unwrap_or_default();
+                extra.sent = sent;
+                row.extra = serde_json::to_string(&extra).unwrap_or(row.extra);
+            }
+        }
         self.conn.execute(
             "INSERT INTO requests
                 (created_at, method, url, headers_text, body_mode, json_body, urlencoded_body, raw_body,
@@ -535,6 +570,7 @@ impl History {
                 params: extra.params,
                 multipart_fields: extra.multipart,
                 options: extra.options,
+                sent_values: extra.sent,
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 method: row.get(2)?,
@@ -917,5 +953,29 @@ X-Api-Key:");
         assert!(h.search_saved("zzz").unwrap().is_empty());
         assert_eq!(h.search_recent("", 5).unwrap().len(), 5);
         assert!(h.search_recent("a_b", 5).unwrap().iter().all(|r| r.id != named + 1000));
+    }
+
+    #[test]
+    fn a_sent_request_remembers_what_its_placeholders_stood_for_but_never_a_secret() {
+        use crate::domain::model::Variable;
+        let h = history();
+        let state = PersistedState {
+            url: "http://h/{{key}}?t={{api_token}}&n={{missing}}".into(),
+            headers_text: "X-Env: {{$env:HOME}}".into(),
+            variables: vec![
+                Variable { name: "key".into(), value: "PRJ-42".into(), secret: false, remember: false },
+                Variable { name: "api_token".into(), value: "s3cret".into(), secret: false, remember: false },
+                Variable { name: "long".into(), value: "x".repeat(900), secret: false, remember: false },
+            ],
+            ..Default::default()
+        };
+        h.insert(&state, Some(200), Some(5)).unwrap();
+        let entry = h.search_recent("", 1).unwrap().remove(0);
+        assert_eq!(entry.sent_values.get("key").map(String::as_str), Some("PRJ-42"));
+        assert!(!entry.sent_values.contains_key("api_token"), "a credential-looking name is never kept");
+        assert!(!entry.sent_values.contains_key("missing") && !entry.sent_values.contains_key("$env:HOME"));
+        // a saved request is a template: it keeps no values
+        let id = h.save_new(&state, "tmpl").unwrap();
+        assert!(h.get(id).unwrap().unwrap().sent_values.is_empty());
     }
 }
