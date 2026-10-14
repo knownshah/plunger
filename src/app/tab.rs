@@ -361,6 +361,7 @@ mod tests {
             source: crate::store::history::Source::Cli,
             options: Default::default(),
             sent_values: Default::default(),
+            group: None,
         };
         let tab = Tab::from_entry(1, &entry, &PersistedState::default());
         let meta = tab.opened_from.expect("opened from history");

@@ -138,6 +138,18 @@ One request can then create an issue with an optional assignee, labels and epic.
 
 A request you save with `save_request` keeps its `timeout_secs`, `follow_redirects`, `insecure_tls` and `select`, and uses them when it is sent by name (a value in the call wins). Fields a saved request cannot keep (`variables`, `use_saved_bearer`, `extract`, `max_body_chars`) are named in `not_saved` in the result.
 
+## Groups
+
+Saved requests and workflows can be filed under a group so unrelated APIs do not mix: `Jira`, or `Jira/Issues` for one level under it. A group is just a name; there is nothing to create first.
+
+- `save_request` and `save_workflow` take `group`. Left out, a new one has no group and a replaced one keeps its group; an empty string takes it out of its group.
+- `list_saved_requests` and `list_workflows` take an optional `group`, and return each item's `group`. `Jira` includes `Jira/Issues`.
+- `set_group` (`kind`: `request` or `workflow`, `name`, `group`) files one without sending its content again, so an agent can tidy a long flat list.
+- On the command line: `plunger save "create issue" ... --group Jira`, `plunger saved --group Jira`, `plunger saved group "create issue" Jira/Issues`, `plunger workflow save close @steps.json --group Jira`, `plunger workflow list --group Jira`, `plunger workflow group close Jira`.
+- In the window, the sidebar shows a collapsible header per group, and **Move to group** is on a row's right-click menu.
+
+Variables stay shared by everything (see Variables in the window); per-group variables are a possible next step.
+
 ## Workflows
 
 A workflow is a saved list of requests where a later one can use a value from an earlier response, for example log in, then call the API with the token. A step is a request (a saved one by name, or `method` / `url` / `headers` / `json` / `body` / `form`) plus:

@@ -132,6 +132,9 @@ pub struct ApiTesterApp {
     font_sig: (u64, [usize; 7]),
     renaming: Option<Rename>,
     saved_open: bool,
+    /// Groups (full paths) folded away in the sidebar, and the text typed for a new group.
+    collapsed_groups: std::collections::HashSet<String>,
+    group_input: String,
     history_open: bool,
 
     /// Variables an agent set (read from the shared database).
@@ -184,6 +187,8 @@ impl ApiTesterApp {
             font_sig: (u64::MAX, [0; 7]),
             renaming: None,
             saved_open: true,
+            collapsed_groups: std::collections::HashSet::new(),
+            group_input: String::new(),
             history_open: true,
             db_version: None,
             last_db_poll: Instant::now(),

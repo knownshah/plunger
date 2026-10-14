@@ -158,6 +158,22 @@ try:
     names = [v["name"] for v in (listed or {}).get("variables", [])]
     check("cleanup left no workflow variables behind", "keep_me" not in names and "transition_id" not in names, names)
 
+    # 6b. groups: filed on save, found by group (and what is under it), moved without re-sending
+    mcp.call("save_request", name="jira search", url=f"{BASE}/search?jql=a", headers=auth, group="Jira / Issues")
+    mcp.call("save_request", name="gitlab ping", url="https://gitlab.example.com/ping", group="GitLab")
+    err, listed, _ = mcp.call("list_saved_requests", group="Jira")
+    found = [r["name"] for r in (listed or {}).get("requests", [])]
+    check("the list can be narrowed to a group and what is under it", found == ["jira search"], found)
+    err, moved, _ = mcp.call("set_group", kind="request", name="gitlab ping", group="Ops")
+    check("set_group moves a saved request", not err and moved and moved["group"] == "Ops", (err, moved))
+    err, shown, _ = mcp.call("get_saved_request", name="jira search")
+    check("get_saved_request says the group", shown and shown.get("group") == "Jira/Issues", shown)
+    err, res, text = mcp.call("save_request", name="bad group", url=f"{BASE}/x", group="a//b")
+    check("a bad group name is refused and nothing is saved", err and "group" in text, text)
+    mcp.call("save_workflow", name="grouped flow", steps=[{"url": f"{BASE}/search?jql=a", "headers": auth}], group="Jira")
+    err, wl, _ = mcp.call("list_workflows", group="Jira")
+    check("workflows are filed and filtered by group", wl and [w["name"] for w in wl["workflows"]] == ["grouped flow"], wl)
+
     # 7. what a careless agent sends is either understood or refused by name, never silently dropped
     err, res, text = mcp.call("send_request", url=f"{BASE}/search?jql=a", headers=[{"name": "Authorization", "value": "Bearer tok_tracker"}])
     check("headers as a list of name/value objects are understood", not err and res and res["status"] == 200, text)

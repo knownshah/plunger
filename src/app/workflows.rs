@@ -15,6 +15,7 @@ pub(super) struct WorkflowItem {
     pub name: String,
     pub steps: Vec<Step>,
     pub last: Option<WorkflowRunRow>,
+    pub group: Option<String>,
 }
 
 /// The open workflow window.
@@ -88,10 +89,21 @@ pub(super) enum ListAction {
     Run(String),
     Copy(String),
     Delete(String),
+    /// File the workflow under a group (None takes it out of its group).
+    MoveToGroup(String, Option<String>),
+    /// Fold a group away or open it again.
+    ToggleGroup(String),
 }
 
 /// The sidebar section. Returns what was chosen on a row: a click opens it, the context menu has the rest.
-pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &mut bool, selected: Option<&str>) -> Option<ListAction> {
+pub(super) fn sidebar_section(
+    ui: &mut egui::Ui,
+    items: &[WorkflowItem],
+    open: &mut bool,
+    selected: Option<&str>,
+    collapsed: &std::collections::HashSet<String>,
+    group_input: &mut String,
+) -> Option<ListAction> {
     if items.is_empty() {
         return None;
     }
@@ -99,9 +111,27 @@ pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &
     super::sidebar::section_header(ui, "WORKFLOWS", items.len(), open, |_| {});
     let mut clicked = None;
     if *open {
+        let mut groups: Vec<String> = items.iter().filter_map(|i| i.group.clone()).collect();
+        groups.dedup();
+        let mut current: Option<&str> = None;
         for item in items {
+            // the list is ordered by group: a header where the group changes, nothing under a folded one
+            if item.group.as_deref() != current {
+                current = item.group.as_deref();
+                if let Some(path) = current {
+                    let count = items.iter().filter(|i| i.group.as_deref() == Some(path)).count();
+                    if super::sidebar::group_header(ui, path, count, collapsed.contains(path)) {
+                        clicked = Some(ListAction::ToggleGroup(path.to_string()));
+                    }
+                }
+            }
+            if item.group.as_deref().is_some_and(|g| super::sidebar::group_is_hidden(g, collapsed)) {
+                continue;
+            }
+            let indent = if item.group.is_some() { 12.0 } else { 0.0 };
             let p = palette();
             let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+            let rect = egui::Rect::from_min_max(rect.min + egui::vec2(indent, 0.0), rect.max);
             if !ui.is_rect_visible(rect) {
                 continue;
             }
@@ -153,6 +183,10 @@ pub(super) fn sidebar_section(ui: &mut egui::Ui, items: &[WorkflowItem], open: &
                     clicked = Some(ListAction::Copy(item.name.clone()));
                     ui.close();
                 }
+                if let Some(chosen) = super::sidebar::move_to_group_menu(ui, &groups, item.group.as_deref(), group_input) {
+                    clicked = Some(ListAction::MoveToGroup(item.name.clone(), chosen));
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Delete\u{2026}").clicked() {
                     clicked = Some(ListAction::Delete(item.name.clone()));
@@ -170,15 +204,22 @@ impl ApiTesterApp {
         let Some(h) = &self.history else { return };
         let rows = h.list_workflows().unwrap_or_default();
         let latest = h.latest_workflow_runs().unwrap_or_default();
+        let groups = h.workflow_groups().unwrap_or_default();
         let runs = self.workflow_view.as_ref().map(|v| h.workflow_runs(&v.name, WORKFLOW_RUNS_KEPT).unwrap_or_default());
         self.workflows = rows
             .into_iter()
             .filter_map(|(name, json)| {
                 let steps = workflow::parse_steps(&json).ok()?;
                 let last = latest.iter().find(|r| r.workflow == name).cloned();
-                Some(WorkflowItem { name, steps, last })
+                let group = groups.get(&name).cloned();
+                Some(WorkflowItem { name, steps, last, group })
             })
             .collect();
+        // ungrouped first, then by group, then by name: the order the sidebar shows them in
+        self.workflows.sort_by(|a, b| {
+            let key = |w: &WorkflowItem| (w.group.clone().unwrap_or_default().to_lowercase(), w.name.to_lowercase());
+            key(a).cmp(&key(b))
+        });
         if let (Some(view), Some(runs)) = (&mut self.workflow_view, runs) {
             view.runs = runs;
         }
@@ -217,6 +258,17 @@ impl ApiTesterApp {
                 }
             }
             ListAction::Copy(name) => self.copy_workflow(ctx, &name),
+            ListAction::MoveToGroup(name, group) => {
+                if let Some(h) = &self.history {
+                    let _ = h.set_workflow_group(&name, group.as_deref());
+                }
+                self.refresh_workflows();
+            }
+            ListAction::ToggleGroup(path) => {
+                if !self.collapsed_groups.remove(&path) {
+                    self.collapsed_groups.insert(path);
+                }
+            }
             ListAction::Delete(name) => self.workflow_delete = Some(name),
         }
     }

@@ -283,6 +283,9 @@ pub struct StoredRequestInfo {
     pub body_type: String,
     /// `{{variables}}` this request needs. Built-ins like `{{$uuid}}` are filled in automatically.
     pub variables_used: Vec<String>,
+    /// The group it is filed under (`Jira`, `Jira/Issues`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// One row of the shared history.
@@ -344,6 +347,7 @@ impl From<&HistoryEntry> for StoredRequestInfo {
                 .collect(),
             body_type: body_type_name(e.body_mode).to_string(),
             variables_used: variables_used(&state),
+            group: e.group.clone(),
         }
     }
 }

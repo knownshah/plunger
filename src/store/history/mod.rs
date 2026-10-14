@@ -80,6 +80,8 @@ pub struct HistoryEntry {
     /// For a request that was sent: the value each non-secret `{{placeholder}}` had when it went out
     /// (secrets are not kept, and long values are cut).
     pub sent_values: BTreeMap<String, String>,
+    /// The group a saved request is filed under, `Jira` or `Jira/Issues`.
+    pub group: Option<String>,
 }
 
 /// Settings a saved request carries besides its form: how long to wait, whether to follow redirects,
@@ -133,6 +135,34 @@ fn sent_values(state: &PersistedState) -> BTreeMap<String, String> {
         out.insert(name, v.value.chars().take(300).collect());
     }
     out
+}
+
+/// A group name as it is stored: parts separated by `/` (`Jira/Issues`), each trimmed, none empty, at most
+/// 80 characters in all. Empty input is no group.
+pub fn normalize_group(raw: &str) -> Result<Option<String>, String> {
+    let parts: Vec<&str> = raw.split('/').map(str::trim).collect();
+    if parts.iter().all(|p| p.is_empty()) {
+        return Ok(None);
+    }
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(format!("`{raw}` is not a group name: a group is like `Jira` or `Jira/Issues`, with no empty part."));
+    }
+    let joined = parts.join("/");
+    if joined.chars().count() > 80 {
+        return Err("A group name is at most 80 characters.".to_string());
+    }
+    if joined.chars().any(char::is_control) {
+        return Err("A group name cannot contain control characters.".to_string());
+    }
+    Ok(Some(joined))
+}
+
+/// True when `group` is `wanted` or lies under it (`Jira/Issues` is under `Jira`), ignoring case.
+pub fn group_matches(group: Option<&str>, wanted: &str) -> bool {
+    let wanted = wanted.trim().trim_matches('/').to_ascii_lowercase();
+    let Some(group) = group else { return wanted.is_empty() };
+    let group = group.to_ascii_lowercase();
+    group == wanted || group.starts_with(&format!("{wanted}/"))
 }
 
 /// Rows that don't fit the fixed columns, stored as one JSON blob so new
@@ -207,7 +237,7 @@ pub struct History {
 }
 
 const COLUMNS: &str = "id, created_at, method, url, headers_text, body_mode, json_body, urlencoded_body, raw_body, \
-                       status, elapsed_ms, extra_json, name, source";
+                       status, elapsed_ms, extra_json, name, source, group_name";
 
 /// A request's columns as written to disk: credentials already blanked.
 struct StoredRequest {
@@ -345,6 +375,13 @@ impl History {
             [],
         )?;
         conn.execute("CREATE INDEX IF NOT EXISTS workflow_runs_by_name ON workflow_runs (workflow, id)", [])?;
+        let workflow_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(workflows)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !workflow_columns.iter().any(|c| c == "group_name") {
+            conn.execute("ALTER TABLE workflows ADD COLUMN group_name TEXT", [])?;
+        }
         let columns: Vec<String> = conn
             .prepare("PRAGMA table_info(requests)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -356,6 +393,8 @@ impl History {
             // 0 once the history is cleared: a saved request outlives that.
             ("in_history", "in_history INTEGER NOT NULL DEFAULT 1"),
             ("source", "source TEXT NOT NULL DEFAULT 'gui'"),
+            // the group a saved request is filed under ("Jira" or "Jira/Issues")
+            ("group_name", "group_name TEXT"),
         ] {
             if !columns.iter().any(|c| c == column) {
                 conn.execute(&format!("ALTER TABLE requests ADD COLUMN {definition}"), [])?;
@@ -528,7 +567,7 @@ impl History {
     pub fn search_saved(&self, term: &str) -> rusqlite::Result<Vec<HistoryEntry>> {
         self.query(
             &format!(
-                "SELECT {COLUMNS} FROM requests WHERE name IS NOT NULL AND ({MATCHES}) ORDER BY name COLLATE NOCASE, id"
+                "SELECT {COLUMNS} FROM requests WHERE name IS NOT NULL AND ({MATCHES}) ORDER BY COALESCE(group_name, '') COLLATE NOCASE, name COLLATE NOCASE, id"
             ),
             params![like_pattern(term)],
         )
@@ -545,6 +584,12 @@ impl History {
         extra.options = options.clone();
         let text = serde_json::to_string(&extra).unwrap_or_default();
         Ok(self.conn.execute("UPDATE requests SET extra_json = ?1 WHERE id = ?2", params![text, id])? > 0)
+    }
+
+    /// Files a saved request under `group` (None takes it out of its group). Returns false when there
+    /// is no such request.
+    pub fn set_group(&self, id: i64, group: Option<&str>) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute("UPDATE requests SET group_name = ?1 WHERE id = ?2", params![group, id])? > 0)
     }
 
     /// One request (history or saved) by id.
@@ -584,6 +629,7 @@ impl History {
                 elapsed_ms: row.get(10)?,
                 name: row.get(12)?,
                 source: Source::parse(&row.get::<_, String>(13)?),
+                group: row.get(14)?,
             })
         })?;
         rows.collect()
@@ -977,5 +1023,58 @@ X-Api-Key:");
         // a saved request is a template: it keeps no values
         let id = h.save_new(&state, "tmpl").unwrap();
         assert!(h.get(id).unwrap().unwrap().sent_values.is_empty());
+    }
+
+    #[test]
+    fn group_names_are_tidied_and_matched_with_what_is_under_them() {
+        assert_eq!(normalize_group("  Jira / Issues ").unwrap(), Some("Jira/Issues".to_string()));
+        assert_eq!(normalize_group("Jira").unwrap(), Some("Jira".to_string()));
+        assert_eq!(normalize_group("   ").unwrap(), None);
+        assert_eq!(normalize_group("").unwrap(), None);
+        for bad in ["Jira//Issues", "/Jira", "Jira/", "a\u{7}b", &"x".repeat(81)] {
+            assert!(normalize_group(bad).is_err(), "{bad:?}");
+        }
+        assert!(group_matches(Some("Jira"), "jira"));
+        assert!(group_matches(Some("Jira/Issues"), "Jira"));
+        assert!(group_matches(Some("Jira/Issues"), "Jira/Issues"));
+        assert!(!group_matches(Some("Jira/Issues"), "Jira/Boards"));
+        assert!(!group_matches(Some("Jiraffe"), "Jira"), "a prefix of the name is not the group");
+        assert!(!group_matches(None, "Jira"));
+    }
+
+    #[test]
+    fn a_saved_request_and_a_workflow_keep_their_group_and_the_list_is_ordered_by_it() {
+        let h = history();
+        let state = PersistedState { url: "http://h/a".into(), ..Default::default() };
+        let a = h.save_new(&state, "b request").unwrap();
+        let b = h.save_new(&state, "a request").unwrap();
+        let c = h.save_new(&state, "c request").unwrap();
+        assert!(h.set_group(a, Some("Jira")).unwrap());
+        assert!(h.set_group(b, Some("GitLab")).unwrap());
+        assert!(!h.set_group(9999, Some("x")).unwrap());
+        let names: Vec<(String, Option<String>)> =
+            h.list_saved().unwrap().into_iter().map(|e| (e.name.unwrap(), e.group)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("c request".to_string(), None),
+                ("a request".to_string(), Some("GitLab".to_string())),
+                ("b request".to_string(), Some("Jira".to_string())),
+            ],
+            "ungrouped first, then by group, then by name"
+        );
+        assert!(h.set_group(c, Some("Jira/Issues")).unwrap());
+        assert!(h.set_group(a, None).unwrap());
+        assert_eq!(h.get(a).unwrap().unwrap().group, None);
+
+        h.save_workflow("flow", "[]").unwrap();
+        assert!(h.set_workflow_group("flow", Some("Jira")).unwrap());
+        assert_eq!(h.workflow_groups().unwrap().get("flow").map(String::as_str), Some("Jira"));
+        // saving the workflow again does not drop its group
+        h.save_workflow("flow", "[]").unwrap();
+        assert_eq!(h.workflow_groups().unwrap().get("flow").map(String::as_str), Some("Jira"));
+        // and saving the form again does not drop a request's group
+        h.update_request(c, &state).unwrap();
+        assert_eq!(h.get(c).unwrap().unwrap().group.as_deref(), Some("Jira/Issues"));
     }
 }

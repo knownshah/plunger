@@ -161,8 +161,10 @@ plunger workflow show <name>            a workflow's steps
 plunger workflow run <name> [--var name=value ...] [--cleanup]
                                         send the steps in order; stops at the first failure.
                                         --cleanup removes the variables the run stored when it is done
-plunger workflow save <name> <steps> [--overwrite]
+plunger workflow save <name> <steps> [--overwrite] [--group G]
                                         <steps> is JSON, or @file.json, or @- for standard input
+plunger workflow list [--group G]       the workflows (only those in a group, or under it)
+plunger workflow group <name> <group>   file a workflow under a group (an empty group takes it out)
 plunger workflow delete <name>
 
 A workflow is a JSON array of steps. A step is a request (saved_request, or method / url / headers /
@@ -287,7 +289,14 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "saved" => {
             match args.next().as_deref() {
-                None => print_json(&agent::list_saved_requests().map_err(error)?),
+                None => print_json(&agent::list_saved_requests(None).map_err(error)?),
+                Some("--group") => print_json(&agent::list_saved_requests(Some(&args.value("saved --group")?)).map_err(error)?),
+                Some("group") => {
+                    let name = args.value("saved group")?;
+                    let group = args.value("saved group")?;
+                    args.finish()?;
+                    print_json(&agent::set_group("request", &name, &group).map_err(error)?);
+                }
                 Some("show") => print_json(&agent::show_saved_request(&args.value("saved show")?).map_err(error)?),
                 Some("delete") => {
                     let name = args.value("saved delete")?;
@@ -301,9 +310,12 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "save" => {
             let (mut name, mut overwrite, mut opts) = (None, false, SendOptions::default());
+            let mut group: Option<String> = None;
             while let Some(arg) = args.next() {
                 if arg == "--overwrite" {
                     overwrite = true;
+                } else if arg == "--group" {
+                    group = Some(args.value(&arg)?);
                 } else if !opts.take(&arg, &mut args)? {
                     if arg.starts_with('-') {
                         return Err(usage_error(format!("Unexpected argument `{arg}`")));
@@ -318,7 +330,7 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                 }
             }
             let name = name.ok_or_else(|| usage_error("Give the request a name"))?;
-            print_json(&agent::save_request(&name, overwrite, &opts.params, Source::Cli).map_err(error)?);
+            print_json(&agent::save_request(&name, overwrite, &opts.params, group.as_deref(), Source::Cli).map_err(error)?);
             Ok(EXIT_OK)
         }
         "install" => {
@@ -394,7 +406,23 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
         }
         "workflow" | "workflows" => {
             match args.next().as_deref() {
-                None | Some("list") => print_json(&workflow::list().map_err(error)?),
+                None | Some("list") => {
+                    let mut group: Option<String> = None;
+                    while let Some(arg) = args.next() {
+                        if arg == "--group" {
+                            group = Some(args.value(&arg)?);
+                        } else {
+                            return Err(usage_error(format!("Unexpected argument `{arg}`")));
+                        }
+                    }
+                    print_json(&workflow::list(group.as_deref()).map_err(error)?);
+                }
+                Some("group") => {
+                    let name = args.value("workflow group")?;
+                    let group = args.value("workflow group")?;
+                    args.finish()?;
+                    print_json(&agent::set_group("workflow", &name, &group).map_err(error)?);
+                }
                 Some("show") => print_json(&workflow::get(&args.value("workflow show")?).map_err(error)?),
                 Some("delete") => {
                     let name = args.value("workflow delete")?;
@@ -406,9 +434,12 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                     let name = args.value("workflow save")?;
                     let mut steps = None;
                     let mut overwrite = false;
+                    let mut group: Option<String> = None;
                     while let Some(arg) = args.next() {
                         if arg == "--overwrite" {
                             overwrite = true;
+                        } else if arg == "--group" {
+                            group = Some(args.value(&arg)?);
                         } else if steps.is_none() {
                             steps = Some(arg);
                         } else {
@@ -418,7 +449,7 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
                     let text = file_or_text(steps.ok_or_else(|| usage_error("Give the steps as JSON, @file.json or @-"))?)?;
                     let steps: Vec<workflow::Step> =
                         serde_json::from_str(&text).map_err(|e| usage_error(format!("The steps aren't valid: {e}")))?;
-                    print_json(&workflow::save(&name, steps, overwrite).map_err(error)?);
+                    print_json(&workflow::save(&name, steps, overwrite, group.as_deref()).map_err(error)?);
                 }
                 Some("run") => {
                     let name = args.value("workflow run")?;

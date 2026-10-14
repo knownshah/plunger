@@ -790,3 +790,36 @@ fn eframe_keeps_the_links_feature_so_help_can_open_the_browser() {
     let eframe = manifest.lines().find(|l| l.starts_with("eframe = { version = \"0.36\"")).expect("the eframe line");
     assert!(eframe.contains("\"links\""), "{eframe}");
 }
+
+#[test]
+fn saved_requests_and_workflows_are_shown_by_group_and_groups_fold() {
+    let mut a = app(PersistedState::default());
+    let state = |url: &str| PersistedState { url: url.into(), ..Default::default() };
+    let h = a.history.as_ref().unwrap();
+    let create = h.save_new(&state("{{base}}/issue"), "create issue").unwrap();
+    let list = h.save_new(&state("{{gitlab}}/projects"), "list projects").unwrap();
+    h.save_new(&state("{{base}}/ping"), "health").unwrap();
+    h.set_group(create, Some("Jira/Issues")).unwrap();
+    h.set_group(list, Some("GitLab")).unwrap();
+    h.save_workflow("close", r#"[{"url": "{{base}}/x"}]"#).unwrap();
+    h.save_workflow("open", r#"[{"url": "{{base}}/y"}]"#).unwrap();
+    h.set_workflow_group("close", Some("Jira")).unwrap();
+    a.refresh_lists();
+
+    let order: Vec<(String, Option<String>)> = a.saved_entries.iter().map(|e| (e.name.clone().unwrap(), e.group.clone())).collect();
+    assert_eq!(order[0], ("health".to_string(), None), "ungrouped first");
+    assert_eq!(order[1].1.as_deref(), Some("GitLab"));
+    assert_eq!(order[2].1.as_deref(), Some("Jira/Issues"));
+    let workflows: Vec<(&str, Option<&str>)> = a.workflows.iter().map(|w| (w.name.as_str(), w.group.as_deref())).collect();
+    assert_eq!(workflows, vec![("open", None), ("close", Some("Jira"))]);
+
+    draw(&mut a);
+    a.collapsed_groups.insert("Jira".to_string());
+    a.collapsed_groups.insert("GitLab".to_string());
+    draw(&mut a);
+    // while filtering, folded groups are opened so a match cannot be hidden
+    a.sidebar_filter = "issue".to_string();
+    a.refresh_lists();
+    draw(&mut a);
+    assert!(a.saved_entries.iter().any(|e| e.name.as_deref() == Some("create issue")));
+}

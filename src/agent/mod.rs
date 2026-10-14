@@ -597,7 +597,7 @@ mod tests {
             select: Some(vec!["$.key".into(), "header:Location".into()]),
             ..Default::default()
         };
-        let saved = requests::save_request_with(&h, &session, "create issue", false, &params, Source::Mcp).unwrap();
+        let saved = requests::save_request_with(&h, &session, "create issue", false, &params, None, Source::Mcp).unwrap();
         // it used to say nothing and keep neither; now both are stored and shown
         let options = saved.options.expect("the options are echoed back");
         assert_eq!((options.timeout_secs, options.follow_redirects), (Some(90), Some(false)));
@@ -633,7 +633,7 @@ mod tests {
         let h = History::in_memory();
         let session = plain_session();
         let params = SendParams { url: Some("https://h/x".into()), timeout_secs: Some(60), ..Default::default() };
-        let saved = requests::save_request_with(&h, &session, "slow", false, &params, Source::Cli).unwrap();
+        let saved = requests::save_request_with(&h, &session, "slow", false, &params, None, Source::Cli).unwrap();
         let id = saved.saved_id.unwrap();
 
         // the window's Save writes the form back; the options an agent saved must survive it
@@ -645,7 +645,7 @@ mod tests {
 
         // saving it again from the agent side with no options clears them
         let again = SendParams { url: Some("https://h/y".into()), ..Default::default() };
-        requests::save_request_with(&h, &session, "slow", true, &again, Source::Cli).unwrap();
+        requests::save_request_with(&h, &session, "slow", true, &again, None, Source::Cli).unwrap();
         assert!(engine::find_saved(&h, "slow").unwrap().options.is_empty());
     }
 
@@ -660,7 +660,7 @@ mod tests {
             max_body_chars: Some(10),
             ..Default::default()
         };
-        let saved = requests::save_request_with(&h, &session, "r", false, &params, Source::Mcp).unwrap();
+        let saved = requests::save_request_with(&h, &session, "r", false, &params, None, Source::Mcp).unwrap();
         let said = saved.not_saved.join(" | ");
         for field in ["variables", "use_saved_bearer", "max_body_chars"] {
             assert!(said.contains(field), "{said}");
@@ -668,7 +668,7 @@ mod tests {
         assert!(saved.options.is_none());
 
         let bad = SendParams { url: Some("https://h/x".into()), select: Some(vec!["bogus".into()]), ..Default::default() };
-        let err = requests::save_request_with(&h, &session, "bad", false, &bad, Source::Mcp).unwrap_err();
+        let err = requests::save_request_with(&h, &session, "bad", false, &bad, None, Source::Mcp).unwrap_err();
         assert!(err.contains("select"), "{err}");
         assert!(engine::find_saved(&h, "bad").is_err(), "nothing was saved");
     }
@@ -758,7 +758,7 @@ mod tests {
             "extract": [{"name": "n", "from": "json:$.a"}]
         }))
         .unwrap();
-        let saved = requests::save_request_with(&h, &session, "all", false, &full, Source::Mcp).unwrap();
+        let saved = requests::save_request_with(&h, &session, "all", false, &full, None, Source::Mcp).unwrap();
         assert_eq!((saved.method.as_str(), saved.url.as_str()), ("PUT", "https://h/{{id}}"));
         assert!(saved.headers.iter().any(|x| x.name == "X-A" && x.value == "1"));
         assert_eq!(saved.body.as_deref(), Some("{\"a\":1}"));
@@ -848,5 +848,41 @@ mod tests {
         assert!(upload.body().unwrap_err().contains("upload"));
         let mention = parse(serde_json::json!({"url": "http://h", "form": {"who": "@ann"}})).unwrap();
         assert!(mention.body().is_ok());
+    }
+
+    #[test]
+    fn a_request_is_saved_in_a_group_found_by_it_and_moved_without_resending() {
+        let h = History::in_memory();
+        let session = plain_session();
+        let p = |url: &str| SendParams { url: Some(url.into()), ..Default::default() };
+        let one = requests::save_request_with(&h, &session, "create issue", false, &p("https://h/issue"), Some("Jira / Issues"), Source::Mcp).unwrap();
+        assert_eq!(one.group.as_deref(), Some("Jira/Issues"), "the name is tidied");
+        requests::save_request_with(&h, &session, "list projects", false, &p("https://g/projects"), Some("GitLab"), Source::Mcp).unwrap();
+        requests::save_request_with(&h, &session, "health", false, &p("https://h/ping"), None, Source::Mcp).unwrap();
+
+        // a bad group name saves nothing
+        let err = requests::save_request_with(&h, &session, "bad", false, &p("https://h/x"), Some("a//b"), Source::Mcp).unwrap_err();
+        assert!(err.contains("not a group name"), "{err}");
+        assert!(engine::find_saved(&h, "bad").is_err());
+
+        // replacing without a group keeps it; an empty group takes the request out of it
+        requests::save_request_with(&h, &session, "create issue", true, &p("https://h/issue2"), None, Source::Mcp).unwrap();
+        assert_eq!(engine::find_saved(&h, "create issue").unwrap().group.as_deref(), Some("Jira/Issues"));
+        let cleared = requests::save_request_with(&h, &session, "create issue", true, &p("https://h/issue3"), Some(""), Source::Mcp).unwrap();
+        assert_eq!(cleared.group, None);
+        h.set_group(engine::find_saved(&h, "create issue").unwrap().id, Some("Jira/Issues")).unwrap();
+
+        // get_saved_request shows the group, and the list can be narrowed to a group (and what is under it)
+        assert_eq!(requests::show_saved_request_in(&h, "create issue").unwrap().group.as_deref(), Some("Jira/Issues"));
+        let groups: Vec<Option<String>> = h.list_saved().unwrap().iter().map(|e| e.group.clone()).collect();
+        assert_eq!(groups, vec![None, Some("GitLab".to_string()), Some("Jira/Issues".to_string())]);
+        let jira: Vec<String> = h
+            .list_saved()
+            .unwrap()
+            .iter()
+            .filter(|e| crate::store::history::group_matches(e.group.as_deref(), "Jira"))
+            .filter_map(|e| e.name.clone())
+            .collect();
+        assert_eq!(jira, vec!["create issue".to_string()]);
     }
 }

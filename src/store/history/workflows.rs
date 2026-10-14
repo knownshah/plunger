@@ -103,6 +103,18 @@ impl History {
         rows.collect()
     }
 
+    /// Files a workflow under `group` (None takes it out of its group); false when there is no such workflow.
+    pub fn set_workflow_group(&self, name: &str, group: Option<&str>) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute("UPDATE workflows SET group_name = ?1 WHERE name = ?2", params![group, name])? > 0)
+    }
+
+    /// The group of each workflow that has one, by name.
+    pub fn workflow_groups(&self) -> rusqlite::Result<std::collections::BTreeMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT name, group_name FROM workflows WHERE group_name IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
     /// Removes a workflow and its recorded runs; false when there was none by that name.
     pub fn delete_workflow(&self, name: &str) -> rusqlite::Result<bool> {
         self.conn.execute("DELETE FROM workflow_runs WHERE workflow = ?1", params![name])?;
