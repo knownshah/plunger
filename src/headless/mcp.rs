@@ -505,6 +505,12 @@ mod tests {
             problems: vec![],
             outline: None,
             hint: None,
+            ttfb_ms: Some(3),
+            final_url: Some("http://h/final".into()),
+            redirects: vec![crate::engine::RedirectHop { status: 301, url: "http://h/final".into() }],
+            sha256: Some("00".into()),
+            detected_type: Some("png".into()),
+            body_file: Some("out.bin".into()),
         };
         assert_eq!(missing_required_keys(&response), Vec::<String>::new(), "send_request");
 

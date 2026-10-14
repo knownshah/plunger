@@ -89,6 +89,9 @@ fn not_saved(params: &SendParams) -> Vec<String> {
     if !params.extract.is_empty() {
         out.push("extract: keep values from a response with extract on the send, or in a workflow step".to_string());
     }
+    if params.include_headers.is_some() {
+        out.push("include_headers: give it when sending".to_string());
+    }
     if params.max_body_chars.is_some() {
         out.push("max_body_chars: give it when sending".to_string());
     }

@@ -277,7 +277,10 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
             if opts.params.saved_request.is_none() && opts.params.url.is_none() {
                 return Err(usage_error("Give a saved request name, or --url"));
             }
-            finish_send(agent::send_request(&opts.params, Source::Cli), opts.fail)
+            match opts.out.clone() {
+                Some(file) => finish_send(send_to_file(&opts.params, &file), opts.fail),
+                None => finish_send(agent::send_request(&opts.params, Source::Cli), opts.fail),
+            }
         }
         "curl" => Ok(crate::headless::curl_cli::run(args.rest())),
         "import" => {
@@ -658,6 +661,29 @@ fn dispatch(args: Vec<String>) -> Result<i32, Exit> {
     }
 }
 
+/// Sends the request and writes the whole body to `file`: raw bytes for a binary body, the (masked) text
+/// otherwise. The result prints without the body and says where it went (`body_file`).
+fn send_to_file(params: &SendParams, file: &str) -> Result<crate::engine::AgentResponse, SendFailure> {
+    let mut params = params.clone();
+    // the body is going to a file, so the size limit for what is printed does not apply
+    params.max_body_chars = Some(20_000_000);
+    let (mut shaped, raw) = agent::send_request_full(&params, Source::Cli)?;
+    let bytes: Vec<u8> = match (&raw.binary, &shaped.json, &shaped.body) {
+        (Some(bytes), _, _) => bytes.clone(),
+        (_, Some(json), _) => serde_json::to_string_pretty(json).unwrap_or_default().into_bytes(),
+        (_, _, Some(text)) => text.clone().into_bytes(),
+        _ => Vec::new(),
+    };
+    std::fs::write(file, &bytes).map_err(|e| SendFailure::Failed(format!("Could not write {file}: {e}")))?;
+    shaped.json = None;
+    shaped.body = None;
+    shaped.outline = None;
+    shaped.hint = None;
+    shaped.body_cut_from_chars = None;
+    shaped.body_file = Some(file.to_string());
+    Ok(shaped)
+}
+
 fn finish_send(result: Result<crate::engine::AgentResponse, SendFailure>, fail: bool) -> Result<i32, Exit> {
     match result {
         Ok(response) => {
@@ -673,6 +699,8 @@ fn finish_send(result: Result<crate::engine::AgentResponse, SendFailure>, fail: 
 struct SendOptions {
     params: SendParams,
     fail: bool,
+    /// `--out FILE`: write the whole body to this file.
+    out: Option<String>,
 }
 
 impl SendOptions {
@@ -721,6 +749,8 @@ impl SendOptions {
             "--insecure" | "-k" => p.insecure_tls = Some(true),
             "--no-follow" => p.follow_redirects = Some(false),
             "--max-body" => p.max_body_chars = Some(args.number(arg)?),
+            "--include-headers" => p.include_headers = Some(args.value(arg)?),
+            "--out" => self.out = Some(args.value(arg)?),
             "--fail" => self.fail = true,
             _ => return Ok(false),
         }

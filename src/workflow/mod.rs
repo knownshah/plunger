@@ -580,6 +580,12 @@ mod tests {
             problems: Vec::new(),
             outline: None,
             hint: None,
+            ttfb_ms: None,
+            final_url: None,
+            redirects: Vec::new(),
+            sha256: None,
+            detected_type: None,
+            body_file: None,
         };
         (shaped, raw)
     }

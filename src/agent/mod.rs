@@ -75,6 +75,11 @@ pub struct SendParams {
     /// keeps the array items whose field equals the value. If a path cannot be read, the whole response is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<Vec<String>>,
+    /// Which response headers to return: `all`, `none`, or `relevant` (location, link, retry-after,
+    /// content-type, content-disposition, etag, rate-limit headers and set-cookie names). Left out:
+    /// `all`, or `none` when `select` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_headers: Option<String>,
     /// Fields this version does not know. They are refused by name, never ignored, so a request that
     /// asks for something Plunger cannot do (`retries`) fails loudly instead of quietly not doing it.
     #[serde(flatten, default, skip_serializing)]
@@ -84,7 +89,7 @@ pub struct SendParams {
 
 /// The names of the fields of [`SendParams`], for the message that refuses an unknown one.
 const SEND_FIELDS: &str = "saved_request, method, url, headers, json, body, form, variables, use_saved_bearer, \
-timeout_secs, follow_redirects, insecure_tls, max_body_chars, extract, select";
+timeout_secs, follow_redirects, insecure_tls, max_body_chars, include_headers, extract, select";
 
 /// `headers` as an object, a list of {"name", "value"} (or {"key", "value"}) objects, or a list of
 /// "Name: value" strings: the shapes an agent tends to produce.
@@ -192,6 +197,11 @@ impl SendParams {
     }
 
     pub(crate) fn to_state(&self, session: &Session, history: &History) -> Result<PersistedState, String> {
+        if let Some(mode) = &self.include_headers {
+            if !matches!(mode.trim().to_ascii_lowercase().as_str(), "all" | "none" | "relevant") {
+                return Err(format!("`include_headers` is `all`, `none` or `relevant`, not `{mode}`."));
+            }
+        }
         if !self.unknown_fields.is_empty() {
             let names: Vec<&str> = self.unknown_fields.keys().map(String::as_str).collect();
             return Err(format!(
@@ -264,6 +274,12 @@ impl std::fmt::Display for SendFailure {
 /// Sends a request exactly like the window's Ctrl+Enter and records it in the
 /// shared history. The result never contains a secret value.
 pub fn send_request(params: &SendParams, source: Source) -> Result<AgentResponse, SendFailure> {
+    send_request_full(params, source).map(|(shaped, _)| shaped)
+}
+
+/// Like [`send_request`], also returning the response as the server sent it, for what needs the real bytes
+/// (writing a body to a file). The raw response must not reach an agent.
+pub fn send_request_full(params: &SendParams, source: Source) -> Result<(AgentResponse, ResponseData), SendFailure> {
     // A mistake in `extract` or `select` is reported now, not after the request has already had its effect.
     check_reading_instructions(params).map_err(SendFailure::NotSent)?;
     let session = Session::load();
@@ -286,7 +302,7 @@ pub fn send_request(params: &SendParams, source: Source) -> Result<AgentResponse
             Err(err) => shaped.problems.push(format!("could not set `{}` from `{}`: {err}", e.name, e.from)),
         }
     }
-    Ok(shaped)
+    Ok((shaped, raw))
 }
 
 /// Whether a workflow condition holds: `expression` with the session's variables and `values` filled in
@@ -311,6 +327,39 @@ pub(crate) fn check_reading_instructions(params: &SendParams) -> Result<(), Stri
         crate::workflow::extract::check_source(path, true).map_err(|m| format!("`select` `{path}`: {m}"))?;
     }
     Ok(())
+}
+
+/// Headers worth an agent's tokens when it asks for `relevant`.
+fn is_relevant_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "location" | "link" | "retry-after" | "content-type" | "content-disposition" | "etag" | "set-cookie" | "www-authenticate" | "x-request-id"
+    ) || n.starts_with("x-ratelimit")
+        || n.starts_with("ratelimit")
+        || n.starts_with("x-rate-limit")
+}
+
+/// Sets the response headers as `include_headers` says; without it, none when `select` was used (a header
+/// is still available as `header:Name`) and all otherwise. A failed `select` returns the whole response.
+fn apply_header_mode(shaped: &mut AgentResponse, every_header: Vec<engine::NameValue>, params: &SendParams) {
+    let default = if params.select.is_some() && shaped.problems.is_empty() { "none" } else { "all" };
+    let mode = params.include_headers.as_deref().map(|m| m.trim().to_ascii_lowercase());
+    shaped.headers = match mode.as_deref().unwrap_or(default) {
+        "none" => Vec::new(),
+        "relevant" => every_header
+            .into_iter()
+            .filter(|h| is_relevant_header(&h.name))
+            .map(|mut h| {
+                // a cookie's name is useful, its value is not: the value is a credential
+                if h.name.eq_ignore_ascii_case("set-cookie") {
+                    h.value = h.value.split(['=', ';']).next().unwrap_or("").to_string();
+                }
+                h
+            })
+            .collect(),
+        _ => every_header,
+    };
 }
 
 /// Replaces `json`, `body` and the response headers with just the values asked for, so a big response
@@ -398,9 +447,11 @@ fn send_prepared_raw(
                     shaped.problems.push(format!("`{m}` is not a standard HTTP method; it was sent as written"));
                 }
             }
+            let every_header = shaped.headers.clone();
             if let Some(paths) = &params.select {
                 apply_select(&mut shaped, &sent.response, paths, &scrubber);
             }
+            apply_header_mode(&mut shaped, every_header, params);
             Ok((shaped, sent.response))
         }
         Err(SendError::Refused(msg)) => {
@@ -742,7 +793,7 @@ mod tests {
 
         let stored = ["method", "url", "headers", "json", "body", "form"];
         let options = ["timeout_secs", "follow_redirects", "insecure_tls", "select"];
-        let reported = ["variables", "use_saved_bearer", "extract", "max_body_chars"];
+        let reported = ["variables", "use_saved_bearer", "extract", "max_body_chars", "include_headers"];
         let only_when_sending = ["saved_request"];
         let mut known: Vec<&str> = stored.iter().chain(&options).chain(&reported).chain(&only_when_sending).copied().collect();
         known.sort();
@@ -754,7 +805,7 @@ mod tests {
         let full: SendParams = serde_json::from_value(serde_json::json!({
             "method": "PUT", "url": "https://h/{{id}}", "headers": {"X-A": "1"}, "json": {"a": 1},
             "variables": {"id": "7"}, "use_saved_bearer": true, "timeout_secs": 45, "follow_redirects": false,
-            "insecure_tls": true, "max_body_chars": 100, "select": ["$.a"],
+            "insecure_tls": true, "max_body_chars": 100, "include_headers": "none", "select": ["$.a"],
             "extract": [{"name": "n", "from": "json:$.a"}]
         }))
         .unwrap();
@@ -884,5 +935,47 @@ mod tests {
             .filter_map(|e| e.name.clone())
             .collect();
         assert_eq!(jira, vec!["create issue".to_string()]);
+    }
+
+    fn headers_of(names: &[(&str, &str)]) -> Vec<engine::NameValue> {
+        names.iter().map(|(n, v)| engine::NameValue { name: (*n).into(), value: (*v).into() }).collect()
+    }
+
+    #[test]
+    fn include_headers_chooses_all_none_or_the_relevant_ones() {
+        let every = headers_of(&[
+            ("server", "nginx"),
+            ("date", "today"),
+            ("Content-Type", "application/json"),
+            ("Location", "/issue/1"),
+            ("Retry-After", "3"),
+            ("X-RateLimit-Remaining", "9"),
+            ("Set-Cookie", "sid=abc123; HttpOnly"),
+            ("x-powered-by", "rust"),
+        ]);
+        let run = |mode: Option<&str>, select: bool| {
+            let mut out = shaped(serde_json::json!({"a": 1}));
+            let params = SendParams {
+                include_headers: mode.map(str::to_string),
+                select: select.then(|| vec!["$.a".to_string()]),
+                ..Default::default()
+            };
+            apply_header_mode(&mut out, every.clone(), &params);
+            out.headers
+        };
+        assert_eq!(run(None, false).len(), 8, "left out: everything");
+        assert!(run(None, true).is_empty(), "left out with select: none");
+        assert!(run(Some("none"), false).is_empty());
+        assert_eq!(run(Some("all"), true).len(), 8, "asked for explicitly, select does not take them away");
+        let relevant = run(Some("Relevant"), false);
+        let names: Vec<&str> = relevant.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["Content-Type", "Location", "Retry-After", "X-RateLimit-Remaining", "Set-Cookie"]);
+        let cookie = relevant.iter().find(|h| h.name == "Set-Cookie").unwrap();
+        assert_eq!(cookie.value, "sid", "only the cookie's name, never its value");
+
+        // a mode that does not exist is refused before anything is sent
+        let bad = SendParams { url: Some("http://h".into()), include_headers: Some("some".into()), ..Default::default() };
+        let err = bad.to_state(&plain_session(), &History::in_memory()).err().unwrap();
+        assert!(err.contains("include_headers"), "{err}");
     }
 }
