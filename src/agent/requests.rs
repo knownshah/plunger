@@ -25,6 +25,13 @@ pub struct ImportedRequest {
     /// Set when saved under `save_as`; it now shows in Plunger's Saved list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_id: Option<i64>,
+    /// What a saved request carries besides its form: `timeout_secs`, `follow_redirects`,
+    /// `insecure_tls` and `select`. They apply when it is sent by name, unless the call gives its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<crate::store::history::SavedOptions>,
+    /// Fields of the call that a saved request does not keep (only said when there are some).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_saved: Vec<String>,
 }
 
 /// A request in the shape an agent reads: what it sends, and which `{{variables}}` it needs.
@@ -51,7 +58,37 @@ pub(super) fn imported_from_state(state: &PersistedState, saved_id: Option<i64>)
             .collect(),
         variables_used: engine::variables_used(state),
         saved_id,
+        options: None,
+        not_saved: Vec::new(),
     }
+}
+
+/// The options a saved request keeps, from the call that saves it.
+fn options_of(params: &SendParams) -> crate::store::history::SavedOptions {
+    crate::store::history::SavedOptions {
+        timeout_secs: params.timeout_secs,
+        follow_redirects: params.follow_redirects,
+        insecure_tls: params.insecure_tls,
+        select: params.select.clone().unwrap_or_default(),
+    }
+}
+
+/// Fields of a save that a saved request cannot keep, so they are not dropped without a word.
+fn not_saved(params: &SendParams) -> Vec<String> {
+    let mut out = Vec::new();
+    if params.variables.as_ref().is_some_and(|v| !v.is_empty()) {
+        out.push("variables: a request keeps its {{placeholders}}, not values for them; set them with set_variable or pass them when sending".to_string());
+    }
+    if params.use_saved_bearer == Some(true) {
+        out.push("use_saved_bearer: ask for it again each time the request is sent".to_string());
+    }
+    if !params.extract.is_empty() {
+        out.push("extract: keep values from a response with extract on the send, or in a workflow step".to_string());
+    }
+    if params.max_body_chars.is_some() {
+        out.push("max_body_chars: give it when sending".to_string());
+    }
+    out
 }
 
 /// Parses a curl command (without sending it), optionally saving it by name.
@@ -73,9 +110,27 @@ pub fn import_curl(curl: &str, save_as: Option<&str>, source: Source) -> Result<
 pub fn save_request(name: &str, overwrite: bool, params: &SendParams, source: Source) -> Result<ImportedRequest, String> {
     let session = Session::load();
     let history = open_history()?;
-    let state = params.to_state(&session, &history)?;
-    let id = save_request_in(&history, name, overwrite, &state, source)?;
-    Ok(imported_from_state(&state, Some(id)))
+    save_request_with(&history, &session, name, overwrite, params, source)
+}
+
+pub(super) fn save_request_with(
+    history: &History,
+    session: &Session,
+    name: &str,
+    overwrite: bool,
+    params: &SendParams,
+    source: Source,
+) -> Result<ImportedRequest, String> {
+    // a `select` that could never work is refused now, not discovered on the first send
+    super::check_reading_instructions(params)?;
+    let state = params.to_state(session, history)?;
+    let id = save_request_in(history, name, overwrite, &state, source)?;
+    let options = options_of(params);
+    history.set_saved_options(id, &options).map_err(|e| format!("Couldn't save the request's options: {e}"))?;
+    let mut shown = imported_from_state(&state, Some(id));
+    shown.options = Some(options).filter(|o| !o.is_empty());
+    shown.not_saved = not_saved(params);
+    Ok(shown)
 }
 
 pub(super) fn save_request_in(history: &History, name: &str, overwrite: bool, state: &PersistedState, source: Source) -> Result<i64, String> {
@@ -96,9 +151,14 @@ pub(super) fn save_request_in(history: &History, name: &str, overwrite: bool, st
 
 /// One saved request in full: method, URL, headers, body and the variables it needs.
 pub fn show_saved_request(name: &str) -> Result<ImportedRequest, String> {
-    let history = open_history()?;
-    let entry = engine::find_saved(&history, name)?;
-    Ok(imported_from_state(&entry.to_persisted_state(), Some(entry.id)))
+    show_saved_request_in(&open_history()?, name)
+}
+
+pub(super) fn show_saved_request_in(history: &History, name: &str) -> Result<ImportedRequest, String> {
+    let entry = engine::find_saved(history, name)?;
+    let mut shown = imported_from_state(&entry.to_persisted_state(), Some(entry.id));
+    shown.options = Some(entry.options.clone()).filter(|o| !o.is_empty());
+    Ok(shown)
 }
 
 /// Removes a saved request (its history entries stay) and returns what was removed.

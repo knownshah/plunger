@@ -69,7 +69,8 @@ pub struct SendParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extract: Vec<crate::workflow::Extract>,
     /// Return only these values instead of the whole body, e.g. ["$.data[0].id", "header:Location", "status"].
-    /// Saves context on a big response; `json` and `body` are then left out.
+    /// Saves context on a big response; `json`, `body` and the headers are then left out. `[?(@.name=='Done')]`
+    /// keeps the array items whose field equals the value. If a path cannot be read, the whole response is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<Vec<String>>,
 }
@@ -103,6 +104,21 @@ impl SendParams {
     }
 
     /// The form state to send: a saved request with overrides, or a new one.
+    /// These parameters with the saved request's own `select` filled in when the call gave none.
+    fn with_saved_select(&self, history: &History) -> SendParams {
+        let mut params = self.clone();
+        if params.select.is_none() {
+            if let Some(name) = &self.saved_request {
+                if let Ok(entry) = engine::find_saved(history, name) {
+                    if !entry.options.select.is_empty() {
+                        params.select = Some(entry.options.select);
+                    }
+                }
+            }
+        }
+        params
+    }
+
     pub(crate) fn to_state(&self, session: &Session, history: &History) -> Result<PersistedState, String> {
         let body = self.body()?;
         if let Some(h) = &self.headers {
@@ -173,6 +189,7 @@ pub fn send_request(params: &SendParams, source: Source) -> Result<AgentResponse
     let session = Session::load();
     let history = open_history().map_err(SendFailure::NotSent)?;
     let state = params.to_state(&session, &history).map_err(SendFailure::NotSent)?;
+    let params = &params.with_saved_select(&history);
     let (mut shaped, raw) = send_prepared_raw(state, params, &session, &history, source)?;
     for e in &params.extract {
         let stored = crate::workflow::extract::extract(&raw, &e.from).and_then(|value| set_variable(e.name.trim(), &value, e.secret, source).map(|info| (info, value)));
@@ -204,22 +221,36 @@ pub(crate) fn check_reading_instructions(params: &SendParams) -> Result<(), Stri
     Ok(())
 }
 
-/// Replaces `json` and `body` with just the values asked for, so a big response costs a few tokens.
-/// Values come from the response as sent and are masked like the rest of the output.
+/// Replaces `json`, `body` and the response headers with just the values asked for, so a big response
+/// costs a few tokens (a header is still available as `header:Name`). Values come from the response as
+/// sent and are masked like the rest of the output.
+///
+/// If a path could not be read (the server answered with an error page, say), the response is returned
+/// whole instead, with the reason in `problems`: the request has already been sent, and sending it
+/// again to see what came back could do its work twice.
 fn apply_select(shaped: &mut AgentResponse, raw: &ResponseData, paths: &[String], scrubber: &Scrubber) {
     let mut selected = BTreeMap::new();
+    let mut failed = false;
     for path in paths {
         match crate::workflow::extract::select(raw, path) {
             Ok(value) => {
                 selected.insert(path.clone(), scrubber.json(&value));
             }
-            Err(err) => shaped.problems.push(format!("could not select `{path}`: {err}")),
+            Err(err) => {
+                failed = true;
+                shaped.problems.push(format!("could not select `{path}`: {err}"));
+            }
         }
     }
     shaped.selected = Some(selected);
+    if failed {
+        shaped.problems.push("`select` did not work, so the whole response is returned (the request was sent once).".to_string());
+        return;
+    }
     shaped.json = None;
     shaped.body = None;
     shaped.body_cut_from_chars = None;
+    shaped.headers.clear();
 }
 
 /// Sends a curl command (parsed, never run as a program); `params` supplies
@@ -248,7 +279,7 @@ pub fn send_request_raw(params: &SendParams, source: Source) -> Result<(AgentRes
     let session = Session::load();
     let history = open_history().map_err(SendFailure::NotSent)?;
     let state = params.to_state(&session, &history).map_err(SendFailure::NotSent)?;
-    send_prepared_raw(state, params, &session, &history, source)
+    send_prepared_raw(state, &params.with_saved_select(&history), &session, &history, source)
 }
 
 fn send_prepared_raw(
@@ -441,5 +472,154 @@ mod tests {
         let h = History::in_memory();
         let session = Session { state: PersistedState::default(), bearer: String::new(), problems: vec![], agent_variables: Default::default() };
         assert!(SendParams::default().to_state(&session, &h).is_err());
+    }
+
+    fn plain_session() -> Session {
+        Session { state: PersistedState::default(), bearer: String::new(), problems: vec![], agent_variables: Default::default() }
+    }
+
+    #[test]
+    fn a_saved_request_keeps_its_timeout_and_select_and_a_call_can_still_override_them() {
+        let h = History::in_memory();
+        let session = plain_session();
+        let params = SendParams {
+            url: Some("https://h/issues".into()),
+            timeout_secs: Some(90),
+            follow_redirects: Some(false),
+            select: Some(vec!["$.key".into(), "header:Location".into()]),
+            ..Default::default()
+        };
+        let saved = requests::save_request_with(&h, &session, "create issue", false, &params, Source::Mcp).unwrap();
+        // it used to say nothing and keep neither; now both are stored and shown
+        let options = saved.options.expect("the options are echoed back");
+        assert_eq!((options.timeout_secs, options.follow_redirects), (Some(90), Some(false)));
+        assert_eq!(options.select, vec!["$.key".to_string(), "header:Location".to_string()]);
+        assert!(saved.not_saved.is_empty());
+
+        let entry = engine::find_saved(&h, "create issue").unwrap();
+        assert_eq!(entry.options.timeout_secs, Some(90));
+        assert_eq!(entry.options.select, vec!["$.key".to_string(), "header:Location".to_string()]);
+
+        // sending it by name uses them: the timeout in the state, the select in the params
+        let by_name = SendParams { saved_request: Some("create issue".into()), ..Default::default() };
+        let state = by_name.to_state(&session, &h).unwrap();
+        assert_eq!((state.timeout_secs, state.follow_redirects), (90, false));
+        assert_eq!(by_name.with_saved_select(&h).select, Some(vec!["$.key".to_string(), "header:Location".to_string()]));
+
+        // a value in the call wins
+        let overridden = SendParams {
+            saved_request: Some("create issue".into()),
+            timeout_secs: Some(5),
+            select: Some(vec!["status".into()]),
+            ..Default::default()
+        };
+        assert_eq!(overridden.to_state(&session, &h).unwrap().timeout_secs, 5);
+        assert_eq!(overridden.with_saved_select(&h).select, Some(vec!["status".to_string()]));
+
+        // get_saved_request shows them
+        assert_eq!(requests::show_saved_request_in(&h, "create issue").unwrap().options.unwrap().timeout_secs, Some(90));
+    }
+
+    #[test]
+    fn saving_the_form_again_keeps_the_options_and_overwriting_replaces_them() {
+        let h = History::in_memory();
+        let session = plain_session();
+        let params = SendParams { url: Some("https://h/x".into()), timeout_secs: Some(60), ..Default::default() };
+        let saved = requests::save_request_with(&h, &session, "slow", false, &params, Source::Cli).unwrap();
+        let id = saved.saved_id.unwrap();
+
+        // the window's Save writes the form back; the options an agent saved must survive it
+        let mut form = engine::find_saved(&h, "slow").unwrap().to_persisted_state();
+        form.url = "https://h/y".into();
+        h.update_request(id, &form).unwrap();
+        let entry = engine::find_saved(&h, "slow").unwrap();
+        assert_eq!((entry.url.as_str(), entry.options.timeout_secs), ("https://h/y", Some(60)));
+
+        // saving it again from the agent side with no options clears them
+        let again = SendParams { url: Some("https://h/y".into()), ..Default::default() };
+        requests::save_request_with(&h, &session, "slow", true, &again, Source::Cli).unwrap();
+        assert!(engine::find_saved(&h, "slow").unwrap().options.is_empty());
+    }
+
+    #[test]
+    fn a_save_says_which_fields_it_does_not_keep_and_refuses_a_select_that_cannot_work() {
+        let h = History::in_memory();
+        let session = plain_session();
+        let params = SendParams {
+            url: Some("https://h/x".into()),
+            variables: Some(BTreeMap::from([("a".into(), "1".into())])),
+            use_saved_bearer: Some(true),
+            max_body_chars: Some(10),
+            ..Default::default()
+        };
+        let saved = requests::save_request_with(&h, &session, "r", false, &params, Source::Mcp).unwrap();
+        let said = saved.not_saved.join(" | ");
+        for field in ["variables", "use_saved_bearer", "max_body_chars"] {
+            assert!(said.contains(field), "{said}");
+        }
+        assert!(saved.options.is_none());
+
+        let bad = SendParams { url: Some("https://h/x".into()), select: Some(vec!["bogus".into()]), ..Default::default() };
+        let err = requests::save_request_with(&h, &session, "bad", false, &bad, Source::Mcp).unwrap_err();
+        assert!(err.contains("select"), "{err}");
+        assert!(engine::find_saved(&h, "bad").is_err(), "nothing was saved");
+    }
+
+    fn shaped(json: serde_json::Value) -> AgentResponse {
+        serde_json::from_value(serde_json::json!({
+            "ok": true, "status": 200, "status_text": "OK", "elapsed_ms": 1, "size_bytes": 10, "truncated_at_10mb": false,
+            "json": json,
+            "headers": [{"name": "server", "value": "x"}, {"name": "location", "value": "/issue/1"}],
+            "request": {"method": "POST", "url": "http://h/issue"}
+        }))
+        .unwrap()
+    }
+
+    fn response_with(body: &str) -> ResponseData {
+        ResponseData {
+            status: 200,
+            headers: vec![("Location".into(), "/issue/1".into())],
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_returns_only_what_was_asked_for_and_leaves_the_header_noise_out() {
+        let raw = response_with(r#"{"key": "PRJ-1", "fields": {"assignee": null}}"#);
+        let mut out = shaped(serde_json::json!({"key": "PRJ-1"}));
+        apply_select(&mut out, &raw, &["$.key".into(), "header:Location".into()], &Scrubber::new(&PersistedState::default(), ""));
+        assert_eq!(out.selected.as_ref().unwrap()["$.key"], "PRJ-1");
+        assert_eq!(out.selected.as_ref().unwrap()["header:Location"], "/issue/1");
+        assert!(out.json.is_none() && out.body.is_none());
+        assert!(out.headers.is_empty(), "the headers are what made every response long");
+        assert!(out.problems.is_empty());
+    }
+
+    #[test]
+    fn a_select_that_fails_returns_the_whole_response_instead_of_nothing() {
+        // the server answered with an error page: select cannot read it, but the request has already been sent
+        let raw = response_with("<html>502 Bad Gateway</html>");
+        let mut out = shaped(serde_json::Value::Null);
+        out.json = None;
+        out.body = Some("<html>502 Bad Gateway</html>".into());
+        apply_select(&mut out, &raw, &["$.key".into()], &Scrubber::new(&PersistedState::default(), ""));
+        assert_eq!(out.body.as_deref(), Some("<html>502 Bad Gateway</html>"), "the body is kept");
+        assert!(!out.headers.is_empty(), "so are the headers");
+        let said = out.problems.join(" | ");
+        assert!(said.contains("not JSON") && said.contains("whole response"), "{said}");
+    }
+
+    #[test]
+    fn selecting_below_a_null_is_null_not_a_problem() {
+        let raw = response_with(r#"{"fields": {"assignee": null, "summary": "x"}}"#);
+        let mut out = shaped(serde_json::json!({"fields": {"assignee": null}}));
+        let paths = ["$.fields.assignee".to_string(), "$.fields.assignee.displayName".to_string(), "$.fields.summary".to_string()];
+        apply_select(&mut out, &raw, &paths, &Scrubber::new(&PersistedState::default(), ""));
+        let selected = out.selected.unwrap();
+        assert_eq!(selected["$.fields.assignee"], serde_json::Value::Null);
+        assert_eq!(selected["$.fields.assignee.displayName"], serde_json::Value::Null);
+        assert_eq!(selected["$.fields.summary"], "x");
+        assert!(out.problems.is_empty(), "{:?}", out.problems);
     }
 }

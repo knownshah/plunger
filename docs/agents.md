@@ -47,7 +47,7 @@ Existing settings are kept (the config is parsed and merged; a file that is not 
 
 The point of Plunger for an agent is fewer tokens and fewer calls:
 
-- `select` returns only the values asked for (`["$.data[0].id", "$.items[*].name", "status"]`; `[*]` collects a field from every item of an array) instead of the whole body.
+- `select` returns only the values asked for (`["$.data[0].id", "$.items[*].name", "status"]`; `[*]` collects a field from every item of an array) instead of the whole body, and leaves the response headers out (ask for one as `header:Name`). `[?(@.name=='Done')]` keeps the items whose field equals a value, so `$.transitions[?(@.name=='Done')].id` finds a Jira transition by name; `extract` with such a path hands over the one matching value, and fails clearly when none or several match. A path through a `null` (an unassigned `assignee`) is `null`, not an error. If a path cannot be read (an error page that is not JSON, say) the whole response comes back instead, with the reason in `problems`, so the request never has to be sent twice to see what happened.
 - A JSON body over `max_body_chars` (default 50,000) comes back as an **outline**: its keys, types, array lengths and one example each, in a few hundred tokens, with a hint to use `select`. It no longer returns cut-off text.
 - `extract` keeps a value (a token, an id) as a variable in the same call, so a login and the request after it need no copy and paste.
 - Workflows run a whole sequence in one call.
@@ -99,10 +99,10 @@ python scripts/mcp-demo-client.py path\to\plunger.exe
 
 | Tool | What it does |
 |---|---|
-| `send_request` | Sends a request and returns `status`, `ok`, `elapsed_ms`, `size_bytes`, `headers`, and the body (`json` when it parses, otherwise `body`). Send a saved request by name with `saved_request`, or describe one with `method`, `url`, `headers`, and one of `json`, `body` or `form`. `variables` adds or overrides `{{variables}}` for this request only. `extract` keeps values from the response as variables (`[{"name": "token", "from": "json:$.access_token"}]`; `from` is `json:$.path`, `header:Name` or `status`), so a login and its token take one call. `select` (`["$.data[0].id", "header:Location"]`) returns just those values under `selected` instead of the whole body. `request.sent_at` is when it was fired. |
+| `send_request` | Sends a request and returns `status`, `ok`, `elapsed_ms`, `size_bytes`, `headers`, and the body (`json` when it parses, otherwise `body`). Send a saved request by name with `saved_request`, or describe one with `method`, `url`, `headers`, and one of `json`, `body` or `form`. `variables` adds or overrides `{{variables}}` for this request only. `extract` keeps values from the response as variables (`[{"name": "token", "from": "json:$.access_token"}]`; `from` is `json:$.path`, `header:Name` or `status`), so a login and its token take one call. `select` (`["$.data[0].id", "header:Location"]`) returns just those values under `selected` instead of the whole body and headers. `request.sent_at` is when it was fired. |
 | `import_curl` | Parses a curl command into a request without sending it. With `save_as`, adds it to the Saved list. |
 | `save_request` | Saves a request without sending it, described like `send_request` plus a `name`. `{{placeholders}}` (even in `Authorization: Bearer {{token}}`) are kept. An existing name is refused unless `overwrite` is true, so a mistake can be fixed. |
-| `get_saved_request` | One saved request in full: method, URL, headers, body and the variables it needs. |
+| `get_saved_request` | One saved request in full: method, URL, headers, body, the variables it needs, and `options` (its `timeout_secs`, `follow_redirects`, `insecure_tls` and `select`, when it has any). |
 | `delete_saved_request` | Removes a saved request (history stays). |
 | `list_saved_requests` | The user's saved requests: name, method, URL, headers, and the `{{variables}}` each one needs (an environment variable shows as `$env:NAME`). |
 | `get_history` | Recent requests, newest first, with who sent each (`gui`, `cli` or `mcp`). Narrow it with `search` (URL, method, name or status), `status` (`401`, `4xx`, `5xx`, `ok`, `fail`, `error`), `min_ms` (the slow ones), `source`, and `saved_request` (how one saved request has been doing). Credentials are blanked. |
@@ -116,6 +116,18 @@ python scripts/mcp-demo-client.py path\to\plunger.exe
 | `list_workflows` / `delete_workflow` | List the saved workflows with their steps, or remove one. |
 
 The read-only tools are marked as such, so a client can run them without asking.
+
+## Variables in a JSON body
+
+A `{{variable}}` inside a JSON string is JSON-escaped for you: a description with a line break, a quote or a backslash arrives as exactly that text, so do not escape it yourself (a value you already escaped would arrive with a visible backslash). Outside a string the value is inserted as JSON, so a variable can be a number, `true`, or a whole array or object:
+
+```json
+{"fields": {"summary": "{{summary}}", "priority": {{priority}}, "labels": {{labels}}}}
+```
+
+with `labels` set to `["backend", "urgent"]`. Only the JSON body is treated this way; a raw or form body, headers and the URL take the value as it is (the query string is percent-encoded).
+
+A request you save with `save_request` keeps its `timeout_secs`, `follow_redirects`, `insecure_tls` and `select`, and uses them when it is sent by name (a value in the call wins). Fields a saved request cannot keep (`variables`, `use_saved_bearer`, `extract`, `max_body_chars`) are named in `not_saved` in the result.
 
 ## Workflows
 

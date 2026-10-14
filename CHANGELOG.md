@@ -4,7 +4,12 @@ All notable changes to Plunger. The format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+### Added
+- `select` and `extract` understand a filter, `[?(@.name=='Done')]` (equality only), so an item can be found by name in one call (#183). With `select`, the response headers are left out (#182), a path through a `null` is `null` instead of a problem (#187), and when a path cannot be read the whole response is returned with the reason instead of nothing (#186).
+
 ### Fixed
+- A `{{variable}}` inside a JSON body string is now JSON-escaped. A value with a newline, a quote or a control character made the server refuse the body, and a backslash could silently turn into a different character (`C:\temp` arrived as a tab and `emp`). A value outside a string is inserted as JSON, so a variable can be a number or a whole array or object. A value you pre-escaped as a workaround is now escaped again: pass the real text (#180).
+- `save_request` kept neither `select` nor `timeout_secs` (nor `follow_redirects`, `insecure_tls`), so the next send of the saved request used the defaults. They are saved, shown by `get_saved_request` and used when it is sent by name. Fields that cannot be kept (`variables`, `use_saved_bearer`, `extract`, `max_body_chars`) are listed in `not_saved`, and a `select` that could not work is refused when saving (#181).
 - Help > Documentation and Help > Report an issue did nothing since 0.6.0 (the toolkit upgrade dropped the feature that opens the browser). They open the browser again.
 
 ## [0.6.0] - 2026-10-10

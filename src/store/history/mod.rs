@@ -1,5 +1,6 @@
 use crate::domain::model::{BodyMode, FormField, KeyValue, PersistedState};
 use crate::domain::redact::{redact_headers_text, redact_url};
+use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -74,6 +75,43 @@ pub struct HistoryEntry {
     pub status: Option<i64>,
     pub elapsed_ms: Option<i64>,
     pub source: Source,
+    pub options: SavedOptions,
+}
+
+/// Settings a saved request carries besides its form: how long to wait, whether to follow redirects,
+/// whether to check the certificate, and which values to read from the response (`select`). They apply
+/// when it is sent by name from an agent, the command line or a workflow, and a value given in the call
+/// wins. The window keeps these session-wide, so it does not apply them.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(default)]
+pub struct SavedOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_redirects: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insecure_tls: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub select: Vec<String>,
+}
+
+impl SavedOptions {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Puts the saved timeout, redirect and TLS settings on `state` (a call's own values go on after).
+    pub fn apply_to(&self, state: &mut PersistedState) {
+        if let Some(t) = self.timeout_secs {
+            state.timeout_secs = t;
+        }
+        if let Some(f) = self.follow_redirects {
+            state.follow_redirects = f;
+        }
+        if let Some(i) = self.insecure_tls {
+            state.insecure_tls = i;
+        }
+    }
 }
 
 /// Rows that don't fit the fixed columns, stored as one JSON blob so new
@@ -83,6 +121,8 @@ pub struct HistoryEntry {
 struct Extra {
     params: Vec<KeyValue>,
     multipart: Vec<FormField>,
+    #[serde(skip_serializing_if = "SavedOptions::is_empty")]
+    options: SavedOptions,
 }
 
 /// `?1` is a LIKE pattern from `like_pattern`.
@@ -164,6 +204,7 @@ impl From<&PersistedState> for StoredRequest {
         let extra = serde_json::to_string(&Extra {
             params: safe.params,
             multipart: safe.multipart_fields,
+            options: SavedOptions::default(),
         })
         .unwrap_or_default();
         Self {
@@ -402,7 +443,13 @@ impl History {
     /// Overwrites a saved request's contents with `state`. Returns false if
     /// the row no longer exists.
     pub fn update_request(&self, id: i64, state: &PersistedState) -> rusqlite::Result<bool> {
-        let row = StoredRequest::from(state);
+        let mut row = StoredRequest::from(state);
+        // saving the form again (the window's Ctrl+S) must not drop the options an agent saved with it
+        if let Some(options) = self.get(id)?.map(|e| e.options).filter(|o| !o.is_empty()) {
+            let mut extra: Extra = serde_json::from_str(&row.extra).unwrap_or_default();
+            extra.options = options;
+            row.extra = serde_json::to_string(&extra).unwrap_or(row.extra);
+        }
         let changed = self.conn.execute(
             "UPDATE requests SET method = ?1, url = ?2, headers_text = ?3, body_mode = ?4, json_body = ?5,
                 urlencoded_body = ?6, raw_body = ?7, extra_json = ?8
@@ -452,6 +499,19 @@ impl History {
         )
     }
 
+    /// Replaces the options a saved request carries (empty clears them).
+    pub fn set_saved_options(&self, id: i64, options: &SavedOptions) -> rusqlite::Result<bool> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT extra_json FROM requests WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+        let mut extra: Extra = serde_json::from_str(&raw).unwrap_or_default();
+        extra.options = options.clone();
+        let text = serde_json::to_string(&extra).unwrap_or_default();
+        Ok(self.conn.execute("UPDATE requests SET extra_json = ?1 WHERE id = ?2", params![text, id])? > 0)
+    }
+
     /// One request (history or saved) by id.
     pub fn get(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {
         Ok(self.query(&format!("SELECT {COLUMNS} FROM requests WHERE id = ?1"), params![id])?.pop())
@@ -474,6 +534,7 @@ impl History {
             Ok(HistoryEntry {
                 params: extra.params,
                 multipart_fields: extra.multipart,
+                options: extra.options,
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 method: row.get(2)?,

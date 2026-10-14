@@ -161,7 +161,7 @@ pub fn build_request(state: &PersistedState, bearer_token: &str) -> Result<Outgo
         BodyMode::None => OutgoingBody::None,
         BodyMode::Json => {
             ensure_header(&mut headers, "Content-Type", "application/json");
-            OutgoingBody::Text(r.apply(&state.json_body))
+            OutgoingBody::Text(r.apply_json(&state.json_body))
         }
         BodyMode::UrlEncoded => {
             ensure_header(&mut headers, "Content-Type", "application/x-www-form-urlencoded");
@@ -410,6 +410,72 @@ mod tests {
         assert!(r.headers.contains(&("X-Trace".into(), "42".into())));
         assert!(r.headers.contains(&("Authorization".into(), "Bearer T0K".into())));
         assert_eq!(text_body(&r), Some("{\"name\":\"Ann\",\"nested\":{\"a\":{\"b\":1}}}"));
+    }
+
+    /// Builds a JSON body from `template` with `value` as the variable `v`, and parses what would be sent.
+    fn json_sent(template: &str, value: &str) -> (String, serde_json::Value) {
+        let mut s = state();
+        s.method = "POST".into();
+        s.variables = vec![var("v", value)];
+        s.body_mode = BodyMode::Json;
+        s.json_body = template.into();
+        let r = build(&s, "");
+        let text = text_body(&r).expect("a text body").to_string();
+        let parsed = serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text:?}"));
+        (text, parsed)
+    }
+
+    #[test]
+    fn a_variable_in_a_json_string_is_escaped_for_every_kind_of_character() {
+        // each of these used to produce a body the server refused ("Illegal unquoted character")
+        for value in [
+            "line one\nline two",   // a newline, the case that was reported
+            "say \"hi\"",           // quotes on their own
+            "C:\\temp\\new",        // backslashes on their own
+            "a\tb",                 // a tab
+            "a\r\nb",               // a Windows line break
+            "bell\u{7}and\u{1}ctl", // other control characters
+            "\\\"",                 // a backslash then a quote
+            "caf\u{e9} \u{65e5}\u{672c} \u{1f9e0}", // non-ASCII is kept
+            "{{not a variable}}",   // text that only looks like a placeholder
+            "",
+        ] {
+            let (_, parsed) = json_sent("{\"description\": \"{{v}}\"}", value);
+            assert_eq!(parsed["description"], value, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn escaping_follows_the_json_around_the_placeholder() {
+        // text before it in the same string, an escaped quote earlier in the string, several placeholders
+        let (_, parsed) = json_sent(r#"{"a": "pre \" {{v}} post", "b": ["{{v}}", "{{v}}"], "{{v}}": 1}"#, "x\"y\nz");
+        assert_eq!(parsed["a"], "pre \" x\"y\nz post");
+        assert_eq!(parsed["b"], serde_json::json!(["x\"y\nz", "x\"y\nz"]));
+        assert_eq!(parsed["x\"y\nz"], 1, "a placeholder in a key is escaped too");
+    }
+
+    #[test]
+    fn a_variable_outside_a_json_string_is_inserted_as_json() {
+        // numbers, booleans and whole arrays or objects: how a list such as labels gets into a body
+        let (_, p) = json_sent(r#"{"n": {{v}}, "s": "{{v}}"}"#, "42");
+        assert_eq!((p["n"].clone(), p["s"].clone()), (serde_json::json!(42), serde_json::json!("42")));
+        let (_, p) = json_sent(r#"{"labels": {{v}}}"#, r#"["a", "b c"]"#);
+        assert_eq!(p["labels"], serde_json::json!(["a", "b c"]));
+        let (_, p) = json_sent(r#"{"fields": {{v}}}"#, r#"{"x": "quote \" kept"}"#);
+        assert_eq!(p["fields"]["x"], "quote \" kept");
+    }
+
+    #[test]
+    fn only_a_json_body_is_json_escaped() {
+        let mut s = state();
+        s.method = "POST".into();
+        s.variables = vec![var("v", "a\nb \"q\"")];
+        s.body_mode = BodyMode::Raw;
+        s.raw_body = "text {{v}}".into();
+        assert_eq!(text_body(&build(&s, "")), Some("text a\nb \"q\""), "a raw body stays raw");
+        s.body_mode = BodyMode::UrlEncoded;
+        s.urlencoded_body = "k={{v}}".into();
+        assert_eq!(text_body(&build(&s, "")), Some("k=a\nb \"q\""));
     }
 
     #[test]

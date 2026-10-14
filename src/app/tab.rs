@@ -355,6 +355,7 @@ mod tests {
             status: Some(404),
             elapsed_ms: Some(12),
             source: crate::store::history::Source::Cli,
+            options: Default::default(),
         };
         let tab = Tab::from_entry(1, &entry, &PersistedState::default());
         let meta = tab.opened_from.expect("opened from history");

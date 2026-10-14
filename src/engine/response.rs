@@ -44,7 +44,7 @@ impl Scrubber {
         let encoded: Vec<(String, String)> = secrets
             .iter()
             .flat_map(|(name, value)| {
-                [crate::domain::query::encode_value(value), percent_encode_all(value)]
+                [crate::domain::query::encode_value(value), percent_encode_all(value), crate::domain::vars::json_escape(value)]
                     .into_iter()
                     .filter(move |e| e != value)
                     .map(move |e| (name.clone(), e))
@@ -65,7 +65,7 @@ impl Scrubber {
         }
         let value = value.trim().to_string();
         let mut secrets = vec![(name.to_string(), value.clone())];
-        for encoded in [crate::domain::query::encode_value(&value), percent_encode_all(&value)] {
+        for encoded in [crate::domain::query::encode_value(&value), percent_encode_all(&value), crate::domain::vars::json_escape(&value)] {
             if encoded != value {
                 secrets.push((name.to_string(), encoded));
             }

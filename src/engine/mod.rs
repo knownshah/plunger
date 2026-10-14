@@ -146,7 +146,8 @@ pub fn apply_overrides(
 /// A saved request, ready to send with the session's variables and options.
 pub fn saved_request_state(history: &History, name: &str, session: &Session) -> Result<(HistoryEntry, PersistedState), String> {
     let entry = find_saved(history, name)?;
-    let state = entry.to_persisted_state().with_session_from(&session.state);
+    let mut state = entry.to_persisted_state().with_session_from(&session.state);
+    entry.options.apply_to(&mut state);
     Ok((entry, state))
 }
 

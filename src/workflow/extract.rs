@@ -23,13 +23,27 @@ pub fn extract(response: &ResponseData, from: &str) -> Result<String, String> {
     if let Some(path) = from.strip_prefix("json:") {
         let text = response.raw_text.as_deref().unwrap_or(&response.body);
         let value: Value = serde_json::from_str(text).map_err(|_| "the response body is not JSON".to_string())?;
-        let found = json_path(&value, path)?;
+        let mut found = json_path(&value, path)?;
+        // `[?(@.name=='Done')].id` names one thing: hand over the id itself, not a one-item array
+        if has_filter(path) {
+            if let Value::Array(items) = &found {
+                match items.as_slice() {
+                    [one] => found = one.clone(),
+                    [] => return Err(format!("nothing in the response matched the filter in `{path}`")),
+                    many => return Err(format!("{} items matched the filter in `{path}`; make it more specific", many.len())),
+                }
+            }
+        }
         return Ok(match found {
             Value::String(s) => s,
             other => other.to_string(),
         });
     }
     Err(format!("`{from}` is not a source: use `json:$.path`, `header:Name` or `status`"))
+}
+
+fn has_filter(path: &str) -> bool {
+    parse_path(path).is_ok_and(|segments| segments.iter().any(|s| matches!(s, Segment::Filter { .. })))
 }
 
 /// Whether `spec` names something that can be read from a response, so a mistake is reported before a
@@ -79,6 +93,34 @@ enum Segment {
     Index(usize),
     /// `[*]`: every item of an array.
     Every,
+    /// `[?(@.name=='Done')]`: the items of an array whose field (a dotted path from `@`) equals the value.
+    Filter { field: Vec<String>, equals: Value },
+}
+
+/// `?(@.a.b == 'x')` (the inside of the brackets). Only equality with a string, number, `true`, `false`
+/// or `null` is understood.
+fn parse_filter(inner: &str, path: &str) -> Result<Segment, String> {
+    let bad = || format!("`[{inner}]` in `{path}`: a filter looks like [?(@.name=='Done')] (equality only)");
+    let body = inner.strip_prefix("?(").and_then(|s| s.strip_suffix(')')).ok_or_else(bad)?.trim();
+    let (left, right) = body.split_once("==").ok_or_else(bad)?;
+    let field = left.trim().strip_prefix("@.").ok_or_else(bad)?;
+    let field: Vec<String> = field.split('.').map(|f| f.trim().to_string()).collect();
+    if field.iter().any(|f| f.is_empty()) {
+        return Err(bad());
+    }
+    let right = right.trim();
+    let quoted = right
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| right.strip_prefix('"').and_then(|s| s.strip_suffix('"')));
+    let equals = match (quoted, right) {
+        (Some(text), _) => Value::String(text.to_string()),
+        (None, "true") => Value::Bool(true),
+        (None, "false") => Value::Bool(false),
+        (None, "null") => Value::Null,
+        (None, number) => serde_json::from_str::<Value>(number).ok().filter(Value::is_number).ok_or_else(bad)?,
+    };
+    Ok(Segment::Filter { field, equals })
 }
 
 fn parse_path(path: &str) -> Result<Vec<Segment>, String> {
@@ -101,11 +143,27 @@ fn parse_path(path: &str) -> Result<Vec<Segment>, String> {
                 segments.push(Segment::Key(chars[start..i].iter().collect()));
             }
             '[' => {
-                let close = chars[i..].iter().position(|c| *c == ']').ok_or_else(|| format!("`{path}` has a [ without a ]"))? + i;
+                // the closing ] is the first one outside quotes, so a filter value may contain one
+                let mut quote: Option<char> = None;
+                let mut close = None;
+                for (offset, c) in chars[i..].iter().enumerate() {
+                    match (quote, *c) {
+                        (Some(q), c) if c == q => quote = None,
+                        (None, '\'' | '"') => quote = Some(*c),
+                        (None, ']') => {
+                            close = Some(i + offset);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let close = close.ok_or_else(|| format!("`{path}` has a [ without a ]"))?;
                 let inner: String = chars[i + 1..close].iter().collect();
                 let inner = inner.trim();
                 if inner == "*" {
                     segments.push(Segment::Every);
+                } else if inner.starts_with('?') {
+                    segments.push(parse_filter(inner, path)?);
                 } else if let Some(quoted) = inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"'))) {
                     segments.push(Segment::Key(quoted.to_string()));
                 } else {
@@ -125,6 +183,11 @@ fn parse_path(path: &str) -> Result<Vec<Segment>, String> {
         }
     }
     Ok(segments)
+}
+
+/// The value at `field` (a chain of object keys) inside `item`.
+fn field_of<'a>(item: &'a Value, field: &[String]) -> Option<&'a Value> {
+    field.iter().try_fold(item, |node, key| node.get(key.as_str()))
 }
 
 /// Follows a path like `$.items[0].id`, `$['a b'].c` or `$.items[*].id` through `value`. A `[*]` collects the
@@ -151,7 +214,14 @@ pub fn json_path(value: &Value, path: &str) -> Result<Value, String> {
                     fanned = true;
                     next.extend(items.iter());
                 }
+                (Segment::Filter { field, equals }, Value::Array(items)) => {
+                    fanned = true;
+                    next.extend(items.iter().filter(|item| field_of(item, field) == Some(equals)));
+                }
+                (Segment::Filter { .. }, _) if !fanned => return Err(format!("a filter is not inside an array (at `{path}`)")),
                 (Segment::Every, _) => return Err(format!("[*] is not inside an array (at `{path}`)")),
+                // a null parent (a Jira issue with no assignee) has no children: the result is null, not an error
+                (Segment::Key(_) | Segment::Index(_), Value::Null) if !fanned => next.push(&Value::Null),
                 (Segment::Key(k), _) if !fanned => return Err(format!("`{k}` is not inside an object (at `{path}`)")),
                 (Segment::Index(n), _) if !fanned => return Err(format!("[{n}] is not inside an array (at `{path}`)")),
                 _ => {}
@@ -246,5 +316,51 @@ mod tests {
         let mut r = response("{\n  \"id\": 12345678901234567890\n}");
         r.raw_text = Some("{\"id\":\"keep\"}".into());
         assert_eq!(extract(&r, "json:$.id").unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_filter_picks_the_items_whose_field_equals_a_value() {
+        let v = json!({"transitions": [
+            {"id": "11", "name": "To Do", "to": {"name": "To Do"}},
+            {"id": "31", "name": "Done", "to": {"name": "Done"}},
+            {"id": "41", "name": "Done", "to": {"name": "Closed"}},
+            {"id": 51, "name": "Won't fix [later]"}
+        ]});
+        assert_eq!(json_path(&v, "$.transitions[?(@.name=='To Do')].id").unwrap(), json!(["11"]));
+        assert_eq!(json_path(&v, "$.transitions[?(@.name == 'Done')].id").unwrap(), json!(["31", "41"]));
+        assert_eq!(json_path(&v, r#"$.transitions[?(@.name=="Done")].id"#).unwrap(), json!(["31", "41"]));
+        assert_eq!(json_path(&v, "$.transitions[?(@.to.name=='Closed')].id").unwrap(), json!(["41"]));
+        assert_eq!(json_path(&v, "$.transitions[?(@.id==51)].name").unwrap(), json!(["Won't fix [later]"]));
+        assert_eq!(json_path(&v, "$.transitions[?(@.name=='nothing')].id").unwrap(), json!([]));
+        assert!(json_path(&v, "$.transitions[?(@.name>'a')].id").is_err());
+        assert!(json_path(&v, "$.transitions[?(name=='a')].id").is_err());
+        assert!(json_path(&v, "$.transitions[?(@.name=='a')").is_err(), "a [ without a ]");
+        assert!(json_path(&json!({"a": 1}), "$.a[?(@.x==1)]").is_err(), "a filter needs an array");
+    }
+
+    #[test]
+    fn extracting_through_a_filter_gives_the_one_value_or_says_why_not() {
+        let r = response(r#"{"transitions": [{"id": "31", "name": "Done"}, {"id": "41", "name": "Reopen"}, {"id": "51", "name": "Reopen"}]}"#);
+        assert_eq!(extract(&r, "json:$.transitions[?(@.name=='Done')].id").unwrap(), "31");
+        assert!(extract(&r, "json:$.transitions[?(@.name=='Nope')].id").unwrap_err().contains("nothing"));
+        assert!(extract(&r, "json:$.transitions[?(@.name=='Reopen')].id").unwrap_err().contains("2 items"));
+        // [*] is unchanged: an array comes back as JSON text
+        assert_eq!(extract(&r, "json:$.transitions[*].id").unwrap(), r#"["31","41","51"]"#);
+        // a filter is accepted before sending, a malformed one is not
+        assert!(check_source("json:$.t[?(@.name=='Done')].id", false).is_ok());
+        assert!(check_source("$.t[?(@.name=='Done')].id", true).is_ok());
+        assert!(check_source("json:$.t[?(@.name)].id", false).is_err());
+        // select keeps the matches as an array
+        assert_eq!(select(&r, "$.transitions[?(@.name=='Done')].id").unwrap(), json!(["31"]));
+    }
+
+    #[test]
+    fn a_path_through_a_null_is_null_but_a_missing_key_is_still_an_error() {
+        let v = json!({"fields": {"assignee": null, "labels": []}});
+        assert_eq!(json_path(&v, "$.fields.assignee").unwrap(), json!(null));
+        assert_eq!(json_path(&v, "$.fields.assignee.displayName").unwrap(), json!(null));
+        assert_eq!(json_path(&v, "$.fields.assignee.avatars[0].url").unwrap(), json!(null));
+        assert!(json_path(&v, "$.fields.reporter").unwrap_err().contains("no `reporter`"));
+        assert!(json_path(&v, "$.fields.labels[0]").unwrap_err().contains("array has 0"));
     }
 }

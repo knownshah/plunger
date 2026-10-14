@@ -57,6 +57,42 @@ impl<'a> Resolver<'a> {
         out
     }
 
+    /// Substitutes into a JSON document. A value that lands inside a JSON string is escaped for it
+    /// (quotes, backslashes, newlines and other control characters), so a description with a line
+    /// break or a quote can't break the body. A value outside a string (`{"n": {{count}}}`,
+    /// `{"labels": {{labels}}}`) is inserted as it is, so it can be a number, `true` or a whole
+    /// JSON array or object.
+    pub fn apply_json(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        let mut in_string = false;
+        while let Some(start) = rest.find("{{") {
+            let before = &rest[..start];
+            in_string = advance_json_string_state(before, in_string);
+            out.push_str(before);
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else {
+                out.push_str(&rest[start..]);
+                return out;
+            };
+            let token_len = 2 + end + 2;
+            let name = after[..end].trim();
+            match self.lookup(name) {
+                Some(value) if in_string => out.push_str(&json_escape(&value)),
+                Some(value) => out.push_str(&value),
+                None => {
+                    if is_valid_name(name) || environment_name(name).is_some() {
+                        self.undefined.insert(name.to_string());
+                    }
+                    out.push_str(&rest[start..start + token_len]);
+                }
+            }
+            rest = &rest[start + token_len..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     fn lookup(&self, name: &str) -> Option<String> {
         if let Some(env_name) = environment_name(name) {
             return std::env::var(env_name).ok();
@@ -82,6 +118,31 @@ impl<'a> Resolver<'a> {
             if names.len() == 1 { "it" } else { "them" },
         ))
     }
+}
+
+/// Whether the end of `text` is inside a JSON string, given whether its start was.
+fn advance_json_string_state(text: &str, mut in_string: bool) -> bool {
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+    }
+    in_string
+}
+
+/// `value` as the inside of a JSON string (no surrounding quotes).
+pub fn json_escape(value: &str) -> String {
+    let quoted = serde_json::to_string(value).unwrap_or_default();
+    quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"')).unwrap_or(&quoted).to_string()
 }
 
 fn environment_name(name: &str) -> Option<&str> {
